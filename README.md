@@ -23,19 +23,17 @@ On the Mac receiving:
 tf recv ~/Downloads
 ```
 
-It prints its address and a token. Copy that token to the other Mac once:
+It prints its address and a three-word phrase, like `apple-river-stone`.
 
-```sh
-tf token 7f3a...
-```
-
-Then send:
+On the sending Mac:
 
 ```sh
 tf send ~/Movies/master.mov ~/Photos/2019
 ```
 
-Both sides exit when the transfer completes. Nothing runs in the background.
+Type the phrase when prompted (or pass it with `--token apple-river-stone`).
+The phrase is fresh every run, so there is nothing to set up or store. Both
+sides exit when the transfer completes. Nothing runs in the background.
 
 ## Speed
 
@@ -55,9 +53,9 @@ MTU of 1500 but never changes network settings itself.
 By design, for now:
 
 - **No encryption.** Traffic is plaintext. The receiver binds only the
-  Thunderbolt interface and requires a shared token, but anyone who can reach
-  that interface with the token can write files. Fine for a cable between two
-  machines you own; not fine for anything else.
+  Thunderbolt interface and requires a three-word phrase, but anyone who can
+  reach that interface with the phrase can write files. Fine for a cable
+  between two machines you own; not fine for anything else.
 - **No extended attributes.** Mode and mtime are preserved; xattrs, ACLs, and
   resource forks are not. `.app` bundles, Photos libraries, and
   quarantine-flagged files will arrive subtly broken.
@@ -74,9 +72,7 @@ tf recv [DIR]              Receive into DIR (default: current directory)
 
 tf send <PATHS>...         Send files or directories
   --peer <ADDR:PORT>       Skip discovery, connect directly
-  --token <HEX>            Override the stored token
-
-tf token [VALUE]           Print the local token, or store one
+  --token <PHRASE>         The phrase shown by tf recv (prompted if omitted)
 ```
 
 ## Security notes
@@ -84,6 +80,10 @@ tf token [VALUE]           Print the local token, or store one
 - The TCP listener binds the `bridge0` address only. It never binds `0.0.0.0`
   and never falls back to another interface — if Thunderbolt Bridge has no
   address, `tf` refuses to run.
+- Each `tf recv` run picks a fresh three-word phrase (about 24 bits of
+  entropy) and accepts exactly one connection, so a wrong guess ends the
+  session. The phrase is hashed to the 32-byte wire token on both sides and
+  compared in constant time.
 - The UDP discovery responder binds the wildcard address, because BSD sockets
   bound to a unicast address do not receive broadcasts. It ignores probes from
   outside the bridge subnet, and can only reply with an address; it cannot
