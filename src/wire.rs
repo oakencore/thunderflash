@@ -20,7 +20,7 @@ pub const ACK: u8 = 0xFF;
 /// against a multi-gigabit link. Shared so both ends agree.
 pub const CHUNK: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     End,
     File,
