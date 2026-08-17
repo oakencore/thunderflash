@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -43,10 +44,14 @@ impl Progress {
         self.shared.total_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// The path here comes off the wire on the receiver and off the disk on
+    /// the sender, and lands on a terminal (or in a log) unquoted. Control
+    /// characters are dropped so a crafted filename cannot move the cursor,
+    /// repaint the line, or forge log entries.
     pub fn set_current(&self, path: &str) {
         if let Ok(mut current) = self.shared.current.lock() {
             current.clear();
-            current.push_str(path);
+            current.extend(path.chars().map(|c| if c.is_control() { '?' } else { c }));
         }
     }
 
@@ -182,6 +187,131 @@ fn render_loop(shared: Arc<Shared>) {
     }
 }
 
+/// Optional per-run diagnostics behind `--stats`, shared across threads like
+/// `Progress`. Every counter is touched once per chunk or per entry, never per
+/// byte, so leaving it attached costs nothing measurable.
+///
+/// New timings belong here as another `AtomicU64` plus a line in `report`.
+#[derive(Default)]
+pub struct Diag {
+    pub disk_bytes: AtomicU64,
+    pub socket_bytes: AtomicU64,
+    pub files: AtomicU64,
+    pub dirs: AtomicU64,
+    pub symlinks: AtomicU64,
+    pub pool_stalls: AtomicU64,
+    pub queue_peak: AtomicU64,
+    /// Sender only: time spent building the transfer list.
+    pub walk_nanos: AtomicU64,
+    /// Receiver only: cumulative sanitize/walk_dirs/create/mkdir/symlink time.
+    pub meta_nanos: AtomicU64,
+    /// Receiver only: time spent in accept, waiting for a sender to connect.
+    /// Subtracted from `total`, which is otherwise mostly idle time.
+    pub accept_nanos: AtomicU64,
+    pub total_nanos: AtomicU64,
+    /// Reported only once later work starts filling them in.
+    pub hash_nanos: AtomicU64,
+    pub flush_nanos: AtomicU64,
+    inflight: AtomicU64,
+}
+
+impl Diag {
+    /// A chunk entered the queue. `fetch_max` keeps the peak lock-free.
+    pub fn queued(&self) {
+        let depth = self.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.queue_peak.fetch_max(depth, Ordering::Relaxed);
+    }
+
+    pub fn dequeued(&self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Compact block on stderr. `sending` chooses the direction labels; one
+    /// counter is not symmetric — the sender's `socket_bytes` includes entry
+    /// headers, the receiver's is payload plus digests only, since its decode
+    /// path has no `Diag` in scope. They differ by the framing bytes.
+    pub fn report(&self, sending: bool) {
+        let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        // Labels follow the counters, not the direction: `disk_bytes` is
+        // always printed first.
+        let (side, disk, socket) = match sending {
+            true => ("send", "disk read", "socket out"),
+            false => ("recv", "disk written", "socket in"),
+        };
+        let mut out = std::io::stderr().lock();
+        let _ = writeln!(out, "stats [{side}]");
+        let _ = writeln!(out, "  {disk:<12} {}", format_bytes(get(&self.disk_bytes)));
+        let _ = writeln!(
+            out,
+            "  {socket:<12} {}",
+            format_bytes(get(&self.socket_bytes))
+        );
+        let _ = writeln!(
+            out,
+            "  {:<12} files {}, dirs {}, symlinks {}",
+            "entries",
+            get(&self.files),
+            get(&self.dirs),
+            get(&self.symlinks)
+        );
+        let _ = writeln!(
+            out,
+            "  {:<12} {}  (queue peak {})",
+            "pool stalls",
+            get(&self.pool_stalls),
+            get(&self.queue_peak)
+        );
+        let (phase, nanos) = match sending {
+            true => ("walk", get(&self.walk_nanos)),
+            false => ("metadata", get(&self.meta_nanos)),
+        };
+        let _ = writeln!(out, "  {phase:<12} {}", format_nanos(nanos));
+        for (label, nanos) in [
+            ("hash", get(&self.hash_nanos)),
+            ("flush", get(&self.flush_nanos)),
+            ("waiting", get(&self.accept_nanos)),
+        ] {
+            if nanos > 0 {
+                let _ = writeln!(out, "  {label:<12} {}", format_nanos(nanos));
+            }
+        }
+        // The receiver's clock starts before accept, so the wait for a sender
+        // to connect would otherwise be reported as transfer time.
+        let _ = writeln!(
+            out,
+            "  {:<12} {}",
+            "total",
+            format_nanos(get(&self.total_nanos).saturating_sub(get(&self.accept_nanos)))
+        );
+        let _ = out.flush();
+    }
+}
+
+/// Accumulate an elapsed interval into a nanosecond counter.
+pub fn add_elapsed(counter: &AtomicU64, since: Instant) {
+    counter.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Take a buffer from a pool, counting the wait when none is free. `try_recv`
+/// first so the uncontended case stays a plain channel pop.
+pub fn pooled_recv(pool: &mpsc::Receiver<Vec<u8>>, diag: Option<&Diag>) -> Option<Vec<u8>> {
+    if let Ok(buf) = pool.try_recv() {
+        return Some(buf);
+    }
+    if let Some(diag) = diag {
+        diag.pool_stalls.fetch_add(1, Ordering::Relaxed);
+    }
+    pool.recv().ok()
+}
+
+pub fn format_nanos(nanos: u64) -> String {
+    match nanos {
+        n if n >= 1_000_000_000 => format!("{:.2} s", n as f64 / 1e9),
+        n if n >= 1_000_000 => format!("{:.1} ms", n as f64 / 1e6),
+        n => format!("{:.1} µs", n as f64 / 1e3),
+    }
+}
+
 /// Keep a long path readable on one line by eliding its middle.
 fn truncate_middle(text: &str, width: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -216,6 +346,17 @@ mod tests {
         assert_eq!(progress.current(), "a/b/c.txt");
     }
 
+    /// Paths arrive from a peer and are printed to a terminal unquoted, so a
+    /// name carrying an escape sequence must not reach it.
+    #[test]
+    fn control_characters_in_a_path_never_reach_the_terminal() {
+        let progress = Progress::new("receiving");
+        progress.set_current("a\x1b[2Kb\r\nc\u{7}");
+        let current = progress.current();
+        assert!(!current.chars().any(|c| c.is_control()), "got {current:?}");
+        assert_eq!(current, "a?[2Kb??c?");
+    }
+
     #[test]
     fn rate_line_formats_bytes_and_throughput() {
         assert_eq!(format_rate(1_500_000_000.0), "1.50 GB/s");
@@ -235,6 +376,44 @@ mod tests {
             out.chars().count()
         );
         assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn queue_peak_keeps_the_deepest_moment_not_the_last() {
+        let diag = Diag::default();
+        diag.queued();
+        diag.queued();
+        diag.queued();
+        diag.dequeued();
+        diag.dequeued();
+        diag.queued();
+        assert_eq!(diag.queue_peak.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_stall_is_counted_only_when_the_pool_is_empty() {
+        let diag = Diag::default();
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+
+        tx.send(vec![1u8; 4]).unwrap();
+        assert!(pooled_recv(&rx, Some(&diag)).is_some());
+        assert_eq!(diag.pool_stalls.load(Ordering::Relaxed), 0);
+
+        // Nothing free yet, so this caller has to wait for the other thread.
+        let late = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            tx.send(vec![2u8; 4]).unwrap();
+        });
+        assert_eq!(pooled_recv(&rx, Some(&diag)), Some(vec![2u8; 4]));
+        assert_eq!(diag.pool_stalls.load(Ordering::Relaxed), 1);
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn durations_are_reported_in_readable_units() {
+        assert_eq!(format_nanos(1_500_000_000), "1.50 s");
+        assert_eq!(format_nanos(2_400_000), "2.4 ms");
+        assert_eq!(format_nanos(900), "0.9 µs");
     }
 
     #[test]

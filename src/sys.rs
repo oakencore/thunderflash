@@ -26,6 +26,32 @@ pub fn set_nocache(fd: RawFd) -> io::Result<()> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// Flush a descriptor all the way to permanent storage.
+///
+/// `fsync` on Darwin only hands the blocks to the drive; the drive may still
+/// hold them in a volatile write cache. `F_FULLFSYNC` asks it to empty that
+/// cache, which is the difference between "written" and "survives a power
+/// cut". Filesystems that cannot do it report ENOTSUP/EINVAL, and there plain
+/// `fsync` is the strongest thing available — say so once and carry on.
+pub fn full_fsync(fd: RawFd) -> io::Result<()> {
+    if unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) } != -1 {
+        return Ok(());
+    }
+    let err = last_error();
+    if !matches!(err.raw_os_error(), Some(libc::ENOTSUP) | Some(libc::EINVAL)) {
+        return Err(err);
+    }
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "tf: this filesystem does not support F_FULLFSYNC; falling back to fsync, \
+             so full durability is unavailable"
+        );
+    });
+    let rc = unsafe { libc::fsync(fd) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 pub fn set_socket_buffers(fd: RawFd, bytes: libc::c_int) -> io::Result<()> {
     for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
         let rc = unsafe {
@@ -116,7 +142,7 @@ pub fn walk_dirs(root: BorrowedFd, components: &[&str]) -> io::Result<OwnedFd> {
 
 pub fn create_file_at(dir: BorrowedFd, name: &str, mode: u32) -> io::Result<File> {
     let cname = cstr(name)?;
-    let fd = unsafe {
+    let open = || unsafe {
         libc::openat(
             dir.as_raw_fd(),
             cname.as_ptr(),
@@ -124,6 +150,16 @@ pub fn create_file_at(dir: BorrowedFd, name: &str, mode: u32) -> io::Result<File
             mode as libc::c_uint,
         )
     };
+    let mut fd = open();
+    if fd == -1 && last_error().raw_os_error() == Some(libc::EACCES) {
+        // A read-only file left by an earlier transfer cannot be reopened for
+        // writing. Replacing it is what a transfer means, so unlink and retry
+        // once. O_NOFOLLOW means this can never be a symlink (that is ELOOP),
+        // and a directory we cannot write to fails the retry too.
+        if unlink_at(dir, name).is_ok() {
+            fd = open();
+        }
+    }
     if fd == -1 {
         Err(last_error())
     } else {
@@ -144,18 +180,18 @@ pub fn unlink_at(dir: BorrowedFd, name: &str) -> io::Result<()> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// atime and mtime, both set to the same second.
+fn timestamps(mtime: i64) -> [libc::timespec; 2] {
+    let ts = libc::timespec {
+        tv_sec: mtime as libc::time_t,
+        tv_nsec: 0,
+    };
+    [ts, ts]
+}
+
 pub fn set_mtime_at(dir: BorrowedFd, name: &str, mtime: i64) -> io::Result<()> {
     let name = cstr(name)?;
-    let times = [
-        libc::timespec {
-            tv_sec: mtime as libc::time_t,
-            tv_nsec: 0,
-        },
-        libc::timespec {
-            tv_sec: mtime as libc::time_t,
-            tv_nsec: 0,
-        },
-    ];
+    let times = timestamps(mtime);
     let rc = unsafe {
         libc::utimensat(
             dir.as_raw_fd(),
@@ -164,6 +200,26 @@ pub fn set_mtime_at(dir: BorrowedFd, name: &str, mtime: i64) -> io::Result<()> {
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// Apply permission bits through an open descriptor, once the file is final.
+///
+/// Only the low 9 bits: the sender ships a whole `st_mode`, and setuid/setgid
+/// from another machine is not something this tool grants.
+pub fn set_mode_fd(fd: RawFd, mode: u32) -> io::Result<()> {
+    let rc = unsafe { libc::fchmod(fd, (mode & 0o777) as libc::mode_t) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// Stamp mtime through an open descriptor.
+///
+/// The receiver's writer thread only knows the file is complete once it has
+/// written the last byte; stamping by path from the network thread would race
+/// against those writes, which bump mtime again.
+pub fn set_mtime_fd(fd: RawFd, mtime: i64) -> io::Result<()> {
+    let times = timestamps(mtime);
+    let rc = unsafe { libc::futimens(fd, times.as_ptr()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -274,6 +330,90 @@ mod tests {
             .unwrap()
             .as_secs();
         assert_eq!(secs, 1_600_000_000);
+    }
+
+    #[test]
+    fn set_mtime_fd_applies_the_requested_time_after_a_write() {
+        let root = scratch("mtime-fd");
+        let root_fd = open_dir(&root).unwrap();
+        let mut file = create_file_at(root_fd.as_fd(), "f.txt", 0o644).unwrap();
+        file.write_all(b"data").unwrap();
+        set_mtime_fd(file.as_raw_fd(), 1_600_000_000).unwrap();
+        drop(file);
+
+        let meta = std::fs::metadata(root.join("f.txt")).unwrap();
+        let secs = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(secs, 1_600_000_000);
+    }
+
+    #[test]
+    fn full_fsync_persists_a_written_file() {
+        let root = scratch("fullfsync");
+        let root_fd = open_dir(&root).unwrap();
+        let mut file = create_file_at(root_fd.as_fd(), "f.bin", 0o644).unwrap();
+        file.write_all(b"durable").unwrap();
+        full_fsync(file.as_raw_fd()).unwrap();
+        full_fsync(root_fd.as_raw_fd()).unwrap();
+
+        assert_eq!(std::fs::read(root.join("f.bin")).unwrap(), b"durable");
+    }
+
+    #[test]
+    fn full_fsync_reports_an_error_it_cannot_fall_back_from() {
+        // A pipe is not a vnode: Darwin refuses F_FULLFSYNC on it with EBADF,
+        // which is not one of the "filesystem cannot do it" codes, so it must
+        // surface rather than turn into a silent fsync.
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let err = full_fsync(writer.as_raw_fd()).unwrap_err();
+        assert!(
+            err.raw_os_error().is_some(),
+            "expected an OS error, got {err}"
+        );
+    }
+
+    /// A read-only file left by an earlier transfer cannot be reopened for
+    /// writing, which used to wedge every retry into that destination.
+    #[test]
+    fn create_file_at_replaces_a_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("readonly-replace");
+        let path = root.join("locked.bin");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let root_fd = open_dir(&root).unwrap();
+        let mut file = create_file_at(root_fd.as_fd(), "locked.bin", 0o644).unwrap();
+        file.write_all(b"new").unwrap();
+        set_mode_fd(file.as_raw_fd(), 0o444).unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    /// The sender ships a whole st_mode; only the permission bits are applied.
+    #[test]
+    fn set_mode_fd_drops_type_and_setuid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("mode-fd");
+        let root_fd = open_dir(&root).unwrap();
+        let file = create_file_at(root_fd.as_fd(), "f.bin", 0o644).unwrap();
+        set_mode_fd(file.as_raw_fd(), 0o104755).unwrap();
+        drop(file);
+
+        let mode = std::fs::metadata(root.join("f.bin"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755, "setuid must not be granted");
     }
 
     #[test]

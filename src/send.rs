@@ -3,17 +3,17 @@ use std::net::{SocketAddrV4, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{SyncSender, sync_channel};
-use std::time::UNIX_EPOCH;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::mpsc::{Receiver as Pool, SyncSender, sync_channel};
+use std::time::{Instant, UNIX_EPOCH};
 
-use crate::progress::Progress;
+use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
-use crate::wire::{ACK, CHUNK, Entry, Kind, MAGIC, Stats, TOKEN_LEN, VERSION, write_terminator};
-
-/// How many chunks may sit between the reader thread and the socket writer.
-/// Bounds memory at CHUNK * this, and provides backpressure when the disk
-/// outruns the link.
-const QUEUE_DEPTH: usize = 4;
+use crate::wire::{
+    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN,
+    encode_handshake, queue_depth, set_timeouts, write_terminator,
+};
 
 pub struct Item {
     pub abs: PathBuf,
@@ -69,7 +69,6 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
                 size: target.len() as u64,
                 mode,
                 mtime,
-                offset: 0,
             },
         });
         return Ok(());
@@ -84,7 +83,6 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
                 size: 0,
                 mode,
                 mtime,
-                offset: 0,
             },
         });
         let mut children: Vec<_> = std::fs::read_dir(abs)?.collect::<Result<_, _>>()?;
@@ -118,7 +116,6 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
             size: meta.len(),
             mode,
             mtime,
-            offset: 0,
         },
     });
     Ok(())
@@ -126,7 +123,57 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
 
 enum Msg {
     Header(Vec<u8>),
-    Chunk(Vec<u8>),
+    /// A symlink target. Tens of bytes, sent once — not worth a pool slot.
+    Target(Vec<u8>),
+    /// File data in a recycled buffer. Only `len` bytes are live; the buffer
+    /// itself is always CHUNK long and goes back to the pool after the write.
+    Chunk {
+        buf: Vec<u8>,
+        len: usize,
+    },
+    /// BLAKE3 of the payload just sent. Queued rather than written directly so
+    /// it lands after that payload's last chunk.
+    Digest(Digest),
+    /// Reader marking the end of a file's chunks. The hash stage turns it into
+    /// a `Digest`; nothing downstream of that stage ever sees it.
+    EndPayload,
+}
+
+/// Middle stage: hashes each chunk between the reader and the socket writer,
+/// so disk reads, hashing and socket writes overlap instead of taking turns.
+/// BLAKE3 is sequential over one file, so this thread is the sender's hashing
+/// budget. Buffers pass straight through; the pool still bounds memory.
+fn hash_items(rx: Pool<io::Result<Msg>>, tx: SyncSender<io::Result<Msg>>, diag: Option<Arc<Diag>>) {
+    let diag = diag.as_deref();
+    let mut hasher = blake3::Hasher::new();
+
+    for message in rx {
+        let forward = match message {
+            Ok(Msg::Chunk { buf, len }) => {
+                let started = Instant::now();
+                hasher.update(&buf[..len]);
+                if let Some(diag) = diag {
+                    add_elapsed(&diag.hash_nanos, started);
+                }
+                Ok(Msg::Chunk { buf, len })
+            }
+            // Empty files finalize an untouched hasher, which is exactly the
+            // digest of empty input.
+            Ok(Msg::EndPayload) => {
+                let started = Instant::now();
+                let digest = *hasher.finalize().as_bytes();
+                hasher.reset();
+                if let Some(diag) = diag {
+                    add_elapsed(&diag.hash_nanos, started);
+                }
+                Ok(Msg::Digest(digest))
+            }
+            other => other,
+        };
+        if tx.send(forward).is_err() {
+            return;
+        }
+    }
 }
 
 /// Connect, hand over every item, and wait for the receiver's ack.
@@ -136,43 +183,135 @@ pub fn send_to(
     token: &[u8; TOKEN_LEN],
     progress: &Progress,
 ) -> io::Result<Stats> {
+    send_to_diag(peer, paths, token, progress, true, None)
+}
+
+/// `send_to` with verification opt-out and diagnostics attached. With
+/// `verify` false the hashing stage is not spawned at all and no digest ever
+/// reaches the wire; the receiver learns this from the handshake flags.
+pub fn send_to_diag(
+    peer: SocketAddrV4,
+    paths: &[PathBuf],
+    token: &[u8; TOKEN_LEN],
+    progress: &Progress,
+    verify: bool,
+    diag: Option<Arc<Diag>>,
+) -> io::Result<Stats> {
+    let started = Instant::now();
     let items = walk(paths)?;
+    if let Some(diag) = &diag {
+        add_elapsed(&diag.walk_nanos, started);
+    }
     let total_bytes: u64 = items.iter().map(|i| i.entry.size).sum();
     progress.set_totals(items.len() as u64, total_bytes);
 
     let mut stream = TcpStream::connect(peer)?;
     sys::set_socket_buffers(stream.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
     stream.set_nodelay(true)?;
+    // A receiver that wedges or vanishes half-open sends no RST and starts no
+    // retransmit timer, so the ACK wait at the end would otherwise be
+    // unbounded.
+    set_timeouts(&stream, IDLE_TIMEOUT)?;
 
-    let mut handshake = Vec::with_capacity(5 + TOKEN_LEN);
-    handshake.extend_from_slice(&MAGIC.to_le_bytes());
-    handshake.push(VERSION);
-    handshake.extend_from_slice(token);
-    stream.write_all(&handshake)?;
+    let flags = if verify { 0 } else { FLAG_NO_VERIFY };
+    stream.write_all(&encode_handshake(flags, token))?;
 
-    let (tx, rx) = sync_channel::<io::Result<Msg>>(QUEUE_DEPTH);
+    let depth = queue_depth();
+    // One buffer per queue slot, plus one being filled by the reader and one
+    // being written to the socket. Any fewer and the pipeline stalls on
+    // itself; any more is memory doing nothing.
+    let (pool_tx, pool_rx) = sync_channel::<Vec<u8>>(depth + 2);
+    for _ in 0..depth + 2 {
+        pool_tx
+            .send(vec![0u8; CHUNK])
+            .expect("pool channel has room for its own prefill");
+    }
+
     let reader_progress = progress.clone();
-    // Reads happen on their own thread so disk and network overlap instead
-    // of taking turns.
-    let reader = std::thread::spawn(move || read_items(items, tx, reader_progress));
+    let reader_diag = diag.clone();
+    // read -> hash -> socket. Reads happen on their own thread so disk and
+    // network overlap instead of taking turns, and hashing gets its own so it
+    // does not eat into either.
+    let (read_tx, read_rx) = sync_channel::<io::Result<Msg>>(depth);
+    let reader_verify = verify;
+    let reader = std::thread::spawn(move || {
+        read_items(
+            items,
+            read_tx,
+            pool_rx,
+            reader_progress,
+            reader_diag,
+            reader_verify,
+        )
+    });
+    // Without verification there is nothing to hash, so the stage is not
+    // spawned at all and the reader feeds the socket directly.
+    let (rx, hasher) = if verify {
+        let (tx, rx) = sync_channel::<io::Result<Msg>>(depth);
+        let hash_diag = diag.clone();
+        (
+            rx,
+            Some(std::thread::spawn(move || {
+                hash_items(read_rx, tx, hash_diag)
+            })),
+        )
+    } else {
+        (read_rx, None)
+    };
 
+    // Teardown is deadlock-free in both directions. If this loop leaves early
+    // (socket error, or `message?`), `rx` and `pool_tx` are both dropped on
+    // the way out, so the reader's next `tx.send` or `pool.recv` fails and it
+    // returns. If the reader leaves first it drops `tx`, this loop sees the
+    // channel close, and we fall through to the join. Neither side can be
+    // left blocked on a channel the other still holds.
     let mut stats = Stats::default();
     for message in rx {
         match message? {
             Msg::Header(bytes) => {
                 stream.write_all(&bytes)?;
                 stats.files += 1;
+                if let Some(diag) = &diag {
+                    diag.socket_bytes.fetch_add(bytes.len() as u64, Relaxed);
+                }
             }
-            Msg::Chunk(bytes) => {
+            Msg::Target(bytes) => {
                 stream.write_all(&bytes)?;
                 stats.bytes += bytes.len() as u64;
                 progress.add_bytes(bytes.len() as u64);
+                if let Some(diag) = &diag {
+                    diag.socket_bytes.fetch_add(bytes.len() as u64, Relaxed);
+                }
             }
+            Msg::Chunk { buf, len } => {
+                stream.write_all(&buf[..len])?;
+                stats.bytes += len as u64;
+                progress.add_bytes(len as u64);
+                if let Some(diag) = &diag {
+                    diag.socket_bytes.fetch_add(len as u64, Relaxed);
+                    diag.dequeued();
+                }
+                // Reader is blocked waiting for this; failure just means it
+                // already finished and dropped the pool.
+                let _ = pool_tx.send(buf);
+            }
+            Msg::Digest(bytes) => {
+                stream.write_all(&bytes)?;
+                if let Some(diag) = &diag {
+                    diag.socket_bytes.fetch_add(DIGEST_LEN as u64, Relaxed);
+                }
+            }
+            // The hash stage replaced it with a Digest.
+            Msg::EndPayload => unreachable!("consumed by the hash stage"),
         }
     }
-    reader
-        .join()
-        .map_err(|_| io::Error::other("reader thread panicked"))?;
+    // Both joins before any `?`, so a reader panic cannot detach the hasher.
+    let read = reader.join();
+    let hashed = hasher.map(|h| h.join());
+    read.map_err(|_| io::Error::other("reader thread panicked"))?;
+    if let Some(Err(_)) = hashed {
+        return Err(io::Error::other("hash thread panicked"));
+    }
 
     write_terminator(&mut stream)?;
     stream.flush()?;
@@ -189,7 +328,15 @@ pub fn send_to(
     Ok(stats)
 }
 
-fn read_items(items: Vec<Item>, tx: SyncSender<io::Result<Msg>>, progress: Progress) {
+fn read_items(
+    items: Vec<Item>,
+    tx: SyncSender<io::Result<Msg>>,
+    pool: Pool<Vec<u8>>,
+    progress: Progress,
+    diag: Option<Arc<Diag>>,
+    verify: bool,
+) {
+    let diag = diag.as_deref();
     for item in items {
         progress.set_current(&item.entry.path);
 
@@ -198,6 +345,14 @@ fn read_items(items: Vec<Item>, tx: SyncSender<io::Result<Msg>>, progress: Progr
         if tx.send(Ok(Msg::Header(header))).is_err() {
             return;
         }
+        if let Some(diag) = diag {
+            match item.entry.kind {
+                Kind::Dir => &diag.dirs,
+                Kind::Symlink => &diag.symlinks,
+                Kind::File | Kind::End => &diag.files,
+            }
+            .fetch_add(1, Relaxed);
+        }
 
         let result = match item.entry.kind {
             // Directories are header-only.
@@ -205,7 +360,38 @@ fn read_items(items: Vec<Item>, tx: SyncSender<io::Result<Msg>>, progress: Progr
             Kind::Symlink => match std::fs::read_link(&item.abs) {
                 Ok(target) => {
                     let bytes = target.to_string_lossy().into_owned().into_bytes();
-                    match tx.send(Ok(Msg::Chunk(bytes))) {
+                    // The header announcing this length is already on the
+                    // wire. A link repointed since the walk would leave the
+                    // receiver framing the next entry from the wrong offset,
+                    // so abort here the way a shrinking file does.
+                    if bytes.len() as u64 != item.entry.size {
+                        let _ = tx.send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{} changed during transfer: announced {} bytes, target is now {}",
+                                item.entry.path,
+                                item.entry.size,
+                                bytes.len()
+                            ),
+                        )));
+                        return;
+                    }
+                    if let Some(diag) = diag {
+                        diag.disk_bytes.fetch_add(bytes.len() as u64, Relaxed);
+                    }
+                    let digest = verify.then(|| {
+                        let hash_started = Instant::now();
+                        let digest = crate::wire::digest(&bytes);
+                        if let Some(diag) = diag {
+                            add_elapsed(&diag.hash_nanos, hash_started);
+                        }
+                        digest
+                    });
+                    let sent = tx.send(Ok(Msg::Target(bytes))).and_then(|()| match digest {
+                        Some(digest) => tx.send(Ok(Msg::Digest(digest))),
+                        None => Ok(()),
+                    });
+                    match sent {
                         Ok(()) => Ok(()),
                         // Receiver hung up; the writer will surface the error.
                         Err(_) => return,
@@ -213,7 +399,7 @@ fn read_items(items: Vec<Item>, tx: SyncSender<io::Result<Msg>>, progress: Progr
                 }
                 Err(err) => Err(err),
             },
-            Kind::File => stream_file(&item, &tx),
+            Kind::File => stream_file(&item, &tx, &pool, diag, verify),
         };
 
         if let Err(err) = result {
@@ -224,36 +410,63 @@ fn read_items(items: Vec<Item>, tx: SyncSender<io::Result<Msg>>, progress: Progr
     }
 }
 
-fn stream_file(item: &Item, tx: &SyncSender<io::Result<Msg>>) -> io::Result<()> {
+fn stream_file(
+    item: &Item,
+    tx: &SyncSender<io::Result<Msg>>,
+    pool: &Pool<Vec<u8>>,
+    diag: Option<&Diag>,
+    verify: bool,
+) -> io::Result<()> {
     let mut file = std::fs::File::open(&item.abs)?;
     // Keep a huge transfer from evicting the machine's entire page cache.
     let _ = sys::set_nocache(file.as_raw_fd());
 
-    let mut remaining = item.entry.size;
-    while remaining > 0 {
-        let want = remaining.min(CHUNK as u64) as usize;
-        let mut buf = vec![0u8; want];
+    let mut sent = 0u64;
+    while sent < item.entry.size {
+        // Blocking here is the real backpressure: no free buffer means the
+        // link has not drained what we already read.
+        let Some(mut buf) = pooled_recv(pool, diag) else {
+            // Writer is gone; it already has the error worth reporting.
+            return Ok(());
+        };
+        // Never read past the size we announced, so a file that grew mid
+        // transfer still matches its header.
+        let want = (item.entry.size - sent).min(CHUNK as u64) as usize;
         let mut filled = 0;
         while filled < want {
-            match file.read(&mut buf[filled..]) {
+            match file.read(&mut buf[filled..want]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
             }
         }
-        if filled == 0 {
-            // The file shrank after we sized it. Pad so the receiver's
-            // length accounting still balances.
-            buf.truncate(want);
-            buf.iter_mut().for_each(|b| *b = 0);
-            filled = want;
+        if filled < want {
+            // Padding the gap would deliver a file whose contents never
+            // existed. Abort instead; the receiver deletes its partial.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} shrank during transfer: expected {} bytes, read {}",
+                    item.entry.path,
+                    item.entry.size,
+                    sent + filled as u64
+                ),
+            ));
         }
-        buf.truncate(filled);
-        remaining -= filled as u64;
-        if tx.send(Ok(Msg::Chunk(buf))).is_err() {
+        sent += filled as u64;
+        if let Some(diag) = diag {
+            diag.disk_bytes.fetch_add(filled as u64, Relaxed);
+            diag.queued();
+        }
+        if tx.send(Ok(Msg::Chunk { buf, len: filled })).is_err() {
             return Ok(());
         }
+    }
+    // The hash stage turns this into the digest. Empty files reach it too, so
+    // every File entry on the wire is followed by exactly one digest.
+    if verify {
+        let _ = tx.send(Ok(Msg::EndPayload));
     }
     Ok(())
 }
@@ -317,6 +530,87 @@ mod tests {
         assert_eq!(items[0].entry.kind, Kind::File);
     }
 
+    /// Drives stream_file with an entry that claims more bytes than the file
+    /// holds — the same state a file that shrinks mid-transfer leaves behind.
+    fn stream_with_claimed_size(name: &str, contents: &[u8], claimed: u64) -> io::Result<Vec<u8>> {
+        let root = scratch(name);
+        let abs = root.join("f.bin");
+        std::fs::write(&abs, contents).unwrap();
+        let item = Item {
+            abs,
+            entry: Entry {
+                kind: Kind::File,
+                path: "f.bin".into(),
+                size: claimed,
+                mode: 0o644,
+                mtime: 0,
+            },
+        };
+        let (tx, rx) = sync_channel::<io::Result<Msg>>(64);
+        let (pool_tx, pool_rx) = sync_channel::<Vec<u8>>(64);
+        for _ in 0..8 {
+            pool_tx.send(vec![0u8; CHUNK]).unwrap();
+        }
+        let result = stream_file(&item, &tx, &pool_rx, None, true);
+        drop(tx);
+        // Recycle so the pool never starves this single-threaded drive.
+        let mut got = Vec::new();
+        for message in rx {
+            if let Ok(Msg::Chunk { buf, len }) = message {
+                got.extend_from_slice(&buf[..len]);
+                let _ = pool_tx.send(buf);
+            }
+        }
+        result.map(|()| got)
+    }
+
+    #[test]
+    fn a_shrinking_file_errors_instead_of_padding_with_zeros() {
+        let err = stream_with_claimed_size("shrink", b"only nine", 9_000).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("shrank"), "got: {err}");
+    }
+
+    #[test]
+    fn a_file_that_grew_sends_exactly_the_recorded_size() {
+        let sent = stream_with_claimed_size("grew", b"0123456789", 4).unwrap();
+        assert_eq!(sent, b"0123");
+    }
+
+    #[test]
+    fn a_multi_chunk_file_streams_every_byte_in_order() {
+        let data: Vec<u8> = (0..CHUNK * 2 + 7).map(|i| (i % 251) as u8).collect();
+        let sent = stream_with_claimed_size("multichunk", &data, data.len() as u64).unwrap();
+        assert_eq!(sent, data);
+    }
+
+    /// The header announcing a symlink's target length is on the wire before
+    /// the target is read, so a link repointed in between must abort the send
+    /// rather than desynchronise the receiver's framing.
+    #[test]
+    fn a_symlink_that_changed_since_the_walk_aborts_the_send() {
+        let root = scratch("link-changed");
+        let link = root.join("l");
+        std::os::unix::fs::symlink("short", &link).unwrap();
+        let items = walk(std::slice::from_ref(&link)).unwrap();
+
+        // Repoint it at a target of a different length, as a racing process
+        // would between the walk and the read.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("a-much-longer-target", &link).unwrap();
+
+        let (tx, rx) = sync_channel::<io::Result<Msg>>(8);
+        let (_pool_tx, pool_rx) = sync_channel::<Vec<u8>>(1);
+        read_items(items, tx, pool_rx, Progress::new("sending"), None, true);
+
+        let err = rx
+            .into_iter()
+            .find_map(|m| m.err())
+            .expect("a changed symlink must produce an error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("changed during transfer"), "{err}");
+    }
+
     #[test]
     fn walk_skips_special_files_instead_of_hanging_on_them() {
         let root = scratch("special");
@@ -325,7 +619,7 @@ mod tests {
         let rc = unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) };
         assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
 
-        let items = walk(&[root.clone()]).unwrap();
+        let items = walk(std::slice::from_ref(&root)).unwrap();
 
         assert!(
             items.iter().any(|i| i.entry.path.ends_with("real.txt")),

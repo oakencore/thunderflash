@@ -155,3 +155,196 @@ fn a_second_transfer_over_the_same_destination_succeeds() {
         std::fs::read(dest.join("tree/big/large.bin")).unwrap(),
     );
 }
+
+/// `--no-verify` changes what crosses the wire, not what lands on disk.
+#[test]
+fn transfers_a_tree_without_verification() {
+    let source = scratch("no-verify-source");
+    let dest = scratch("no-verify-dest");
+    build_tree(&source);
+
+    let token = [43u8; TOKEN_LEN];
+    let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
+    let port = receiver.port().unwrap();
+    let handle = std::thread::spawn(move || {
+        let progress = Progress::new("receiving");
+        receiver.accept_one(&progress).unwrap()
+    });
+
+    let progress = Progress::new("sending");
+    let sent = send::send_to_diag(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        &[source.join("tree")],
+        &token,
+        &progress,
+        false,
+        None,
+    )
+    .unwrap();
+    let received = handle.join().unwrap();
+
+    assert_eq!(sent.files, received.files);
+    assert_eq!(sent.bytes, received.bytes);
+    assert_eq!(
+        std::fs::read(source.join("tree/big/large.bin")).unwrap(),
+        std::fs::read(dest.join("tree/big/large.bin")).unwrap(),
+    );
+    for i in [0, 999, 1999] {
+        let name = format!("tree/small/f{i:04}.txt");
+        assert_eq!(
+            std::fs::read_to_string(dest.join(&name)).unwrap(),
+            format!("file {i}"),
+            "mismatch in {name}"
+        );
+    }
+    assert_eq!(std::fs::read(dest.join("tree/zero.bin")).unwrap().len(), 0);
+    assert!(dest.join("tree/empty").is_dir());
+    assert_eq!(
+        std::fs::read_link(dest.join("tree/link"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "big/large.bin"
+    );
+}
+
+/// `--durable` changes when the receiver acknowledges, not what it writes.
+#[test]
+fn transfers_a_tree_with_durable_flushes() {
+    let source = scratch("durable-source");
+    let dest = scratch("durable-dest");
+    build_tree(&source);
+
+    let token = [23u8; TOKEN_LEN];
+    let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token)
+        .unwrap()
+        .with_durable(true);
+    let port = receiver.port().unwrap();
+    let handle = std::thread::spawn(move || {
+        let progress = Progress::new("receiving");
+        receiver.accept_one(&progress).unwrap()
+    });
+
+    let progress = Progress::new("sending");
+    let sent = send::send_to(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        &[source.join("tree")],
+        &token,
+        &progress,
+    )
+    .unwrap();
+    let received = handle.join().unwrap();
+
+    assert_eq!(sent.files, received.files);
+    assert_eq!(sent.bytes, received.bytes);
+    assert_eq!(
+        std::fs::read(source.join("tree/big/large.bin")).unwrap(),
+        std::fs::read(dest.join("tree/big/large.bin")).unwrap(),
+    );
+    // A zero-byte file is flushed like any other; a symlink is never flushed.
+    assert_eq!(std::fs::read(dest.join("tree/zero.bin")).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::read_link(dest.join("tree/link"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "big/large.bin"
+    );
+}
+
+/// Nothing to fsync at all: the flush path must not assume a file was opened.
+#[test]
+fn durable_survives_a_symlink_only_transfer() {
+    let source = scratch("durable-links-source");
+    let dest = scratch("durable-links-dest");
+    std::fs::create_dir_all(source.join("links")).unwrap();
+    std::os::unix::fs::symlink("nowhere", source.join("links/dangling")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", source.join("links/other")).unwrap();
+
+    let token = [24u8; TOKEN_LEN];
+    let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token)
+        .unwrap()
+        .with_durable(true);
+    let port = receiver.port().unwrap();
+    let handle = std::thread::spawn(move || {
+        let progress = Progress::new("receiving");
+        receiver.accept_one(&progress).unwrap()
+    });
+
+    let progress = Progress::new("sending");
+    send::send_to(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        &[source.join("links")],
+        &token,
+        &progress,
+    )
+    .unwrap();
+    handle.join().unwrap();
+
+    assert_eq!(
+        std::fs::read_link(dest.join("links/dangling"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "nowhere"
+    );
+    assert!(dest.join("links/other").is_symlink());
+}
+
+/// Read-only files and directories must transfer, and must still transfer the
+/// second time over a destination that already holds the read-only copies.
+#[test]
+fn read_only_files_and_directories_survive_a_retransfer() {
+    let source = scratch("readonly-src");
+    let dest = scratch("readonly-dst");
+    std::fs::create_dir_all(source.join("tree/locked")).unwrap();
+    std::fs::write(source.join("tree/locked/report.txt"), b"final").unwrap();
+    std::fs::set_permissions(
+        source.join("tree/locked/report.txt"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        source.join("tree/locked"),
+        std::fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+
+    let landed = dest.join("tree/locked/report.txt");
+    for pass in 1..=2 {
+        let token = [51u8; TOKEN_LEN];
+        let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
+        let port = receiver.port().unwrap();
+        let handle = std::thread::spawn(move || {
+            let progress = Progress::new("receiving");
+            receiver.accept_one(&progress)
+        });
+        let progress = Progress::new("sending");
+        send::send_to(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            &[source.join("tree")],
+            &token,
+            &progress,
+        )
+        .unwrap_or_else(|err| panic!("pass {pass} failed to send: {err}"));
+        handle
+            .join()
+            .unwrap()
+            .unwrap_or_else(|err| panic!("pass {pass} failed to receive: {err}"));
+
+        assert_eq!(std::fs::read(&landed).unwrap(), b"final", "pass {pass}");
+        assert_eq!(
+            std::fs::metadata(&landed).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "pass {pass}: the sender's mode must be applied"
+        );
+    }
+
+    // The destination directory is left writable on purpose, so a retry can
+    // replace what is inside it.
+    let dir_mode = std::fs::metadata(dest.join("tree/locked"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(dir_mode & 0o700, 0o700, "got {dir_mode:o}");
+}
