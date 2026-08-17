@@ -1,0 +1,22 @@
+[package]
+name = "thunderflash"
+version = "0.1.0"
+edition = "2024"
+description = "Fast file transfer between two Macs over a Thunderbolt cable"
+
+[lib]
+name = "thunderflash"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tf"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
