@@ -102,6 +102,14 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
         return Ok(());
     }
 
+    // FIFOs, sockets and devices are not sendable. A FIFO would block
+    // stream_file's open() forever; the rest fail or produce garbage.
+    // Skipping with a warning beats a silent hang.
+    if !meta.file_type().is_file() {
+        eprintln!("tf: skipping {rel}: not a regular file");
+        return Ok(());
+    }
+
     items.push(Item {
         abs: abs.to_path_buf(),
         entry: Entry {
@@ -307,5 +315,26 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].entry.path, "solo.bin");
         assert_eq!(items[0].entry.kind, Kind::File);
+    }
+
+    #[test]
+    fn walk_skips_special_files_instead_of_hanging_on_them() {
+        let root = scratch("special");
+        std::fs::write(root.join("real.txt"), b"ok").unwrap();
+        let fifo = std::ffi::CString::new(root.join("pipe").to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let items = walk(&[root.clone()]).unwrap();
+
+        assert!(
+            items.iter().any(|i| i.entry.path.ends_with("real.txt")),
+            "regular files must still be walked"
+        );
+        assert!(
+            !items.iter().any(|i| i.entry.path.ends_with("pipe")),
+            "FIFOs must be skipped, got: {:?}",
+            items.iter().map(|i| &i.entry.path).collect::<Vec<_>>()
+        );
     }
 }
