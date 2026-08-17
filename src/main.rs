@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use thunderflash::awake;
 use thunderflash::iface::{self, Bridge};
 use thunderflash::phrase;
 use thunderflash::progress::Progress;
@@ -67,6 +68,7 @@ fn run() -> io::Result<()> {
 fn receive(dir: PathBuf, port: u16) -> io::Result<()> {
     let bridge = iface::find_bridge(IFACE)?;
     warn_about_mtu(&bridge);
+    let _awake = keep_awake();
 
     // A fresh phrase every run: the receiver accepts exactly one connection,
     // so a wrong guess costs the attacker the whole session.
@@ -105,6 +107,7 @@ fn transmit(
 ) -> io::Result<()> {
     let bridge = iface::find_bridge(IFACE)?;
     warn_about_mtu(&bridge);
+    let _awake = keep_awake();
 
     let phrase = match token {
         Some(phrase) => phrase,
@@ -138,6 +141,18 @@ fn prompt_for_phrase() -> io::Result<String> {
         ));
     }
     Ok(line.to_string())
+}
+
+/// Both ends of a transfer run tf, so both Macs stay awake. Failure to
+/// spawn caffeinate is a warning, not a reason to abort the transfer.
+fn keep_awake() -> Option<awake::KeepAwake> {
+    match awake::start() {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            eprintln!("tf: could not prevent sleep (caffeinate: {err})");
+            None
+        }
+    }
 }
 
 /// Jumbo frames are worth real throughput at multi-gigabit rates, but

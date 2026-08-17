@@ -35,6 +35,10 @@ Type the phrase when prompted (or pass it with `--token apple-river-stone`).
 The phrase is fresh every run, so there is nothing to set up or store. Both
 sides exit when the transfer completes. Nothing runs in the background.
 
+Both Macs are kept awake during the transfer via `caffeinate`; the assertion
+is released as soon as `tf` exits. Closing a laptop lid on battery still
+sleeps the machine, so keep the lids open.
+
 ## Speed
 
 `tf` prints live throughput. On a Thunderbolt 4 link expect roughly

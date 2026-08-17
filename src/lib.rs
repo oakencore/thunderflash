@@ -1,3 +1,4 @@
+pub mod awake;
 pub mod iface;
 pub mod phrase;
 pub mod progress;
