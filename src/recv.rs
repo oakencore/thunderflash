@@ -12,8 +12,8 @@ use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
     ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, HANDSHAKE_LEN, HANDSHAKE_TIMEOUT,
-    IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN, ct_eq, decode_handshake, queue_depth, sanitize,
-    set_timeouts,
+    IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN, ct_eq, decode_handshake, encode_bitmap, queue_depth,
+    sanitize, set_timeouts,
 };
 
 /// Work handed to the writer thread. `Begin` carries the descriptors the
@@ -43,7 +43,13 @@ enum Msg {
 struct InFlight {
     file: File,
     parent: Arc<OwnedFd>,
+    /// The name the bytes land under while they are still in doubt: a scratch
+    /// dot-file beside the real one, and the name the drop below removes.
     name: String,
+    /// Where the finished file belongs. `None` only when the temp name would
+    /// have been too long for the filesystem and the write went in place, so
+    /// there is nothing left to rename.
+    final_name: Option<String>,
     mtime: i64,
     /// Sender-supplied permission bits, applied once the contents are final.
     mode: u32,
@@ -53,7 +59,9 @@ struct InFlight {
 }
 
 impl Drop for InFlight {
-    /// A partial file that looks complete is worse than no file at all.
+    /// A partial file that looks complete is worse than no file at all — and
+    /// because the partial lives under the temp name, the copy already at the
+    /// real name survives untouched.
     fn drop(&mut self) {
         if !self.finished {
             let _ = sys::unlink_at(self.parent.as_fd(), &self.name);
@@ -124,6 +132,17 @@ fn write_loop(
                             drop(rx);
                             return Err(err);
                         }
+                    }
+                    // The last step, and the only one that makes the new
+                    // contents visible under the real name: everything above
+                    // can still fail with the previous file intact.
+                    if let Some(final_name) = open.final_name.take()
+                        && let Err(err) =
+                            sys::rename_at(open.parent.as_fd(), &open.name, &final_name)
+                    {
+                        drop(open);
+                        drop(rx);
+                        return Err(err);
                     }
                     open.finished = true;
                 }
@@ -239,7 +258,43 @@ impl Receiver {
         set_timeouts(&stream, HANDSHAKE_TIMEOUT)?;
         let verify = self.verify_handshake(&mut stream, peer)?;
         set_timeouts(&stream, IDLE_TIMEOUT)?;
-        self.receive_entries(&mut stream, progress, verify)
+        let (skipped_files, skipped_bytes) = self.answer_manifest(&mut stream)?;
+        let mut stats = self.receive_entries(&mut stream, progress, verify)?;
+        stats.skipped_files = skipped_files;
+        stats.skipped_bytes = skipped_bytes;
+        Ok(stats)
+    }
+
+    /// Manifest phase: the entry list arrives first, headers only, and we
+    /// answer with one bit per File entry — set meaning we already hold that
+    /// exact file, so the sender omits it from the data phase entirely.
+    ///
+    /// Nothing is created here. No failure of the check is fatal either: a
+    /// file we cannot stat, for any reason at all, is simply one we do not
+    /// have, and the transfer carries on as if v2. Returns what the answer
+    /// saved, so the summary can say so.
+    fn answer_manifest(&self, stream: &mut TcpStream) -> io::Result<(u64, u64)> {
+        let root = sys::open_dir(&self.dest)?;
+        let mut bits = Vec::new();
+        let (mut files, mut bytes) = (0u64, 0u64);
+
+        while let Some(entry) = Entry::decode(stream)? {
+            // Dirs are EEXIST-tolerant and symlink payloads are tens of bytes,
+            // so only files are worth an answer.
+            if entry.kind != Kind::File {
+                continue;
+            }
+            let have = already_have(root.as_fd(), &entry);
+            if have {
+                files += 1;
+                bytes += entry.size;
+            }
+            bits.push(have);
+        }
+
+        stream.write_all(&encode_bitmap(&bits))?;
+        stream.flush()?;
+        Ok((files, bytes))
     }
 
     /// Returns whether the sender's stream carries digests to check.
@@ -436,6 +491,26 @@ impl Receiver {
     }
 }
 
+/// Does the destination already hold this exact file?
+///
+/// Deliberately total: every way of not knowing — a path we refuse, a missing
+/// component, a symlink where a file should be, a directory we cannot open —
+/// answers "no". The check only ever decides whether bytes travel, so being
+/// wrong costs a retransfer, while failing here would cost the transfer.
+///
+/// Size and mtime are enough because the receiver stamps the sender's mtime on
+/// completion: a file that matches both was put there by this tool, from this
+/// source, and a file still being written has neither.
+fn already_have(root: BorrowedFd, entry: &Entry) -> bool {
+    let Ok(components) = sanitize(&entry.path) else {
+        return false;
+    };
+    matches!(
+        sys::stat_regular_file(root, &components),
+        Ok((size, mtime)) if size == entry.size && mtime == entry.mtime
+    )
+}
+
 /// The directory the previous entry lived in, kept open.
 ///
 /// Entries arrive depth-first sorted, so consecutive entries nearly always
@@ -535,9 +610,26 @@ fn pump_file(
     verify: bool,
 ) -> io::Result<()> {
     let meta_started = Instant::now();
-    // Created writable whatever the sender's mode says; the writer applies
-    // the real permission bits once the contents are final.
-    let file = sys::create_file_at(dir.as_fd(), name, entry.mode | 0o600)?;
+    // The bytes land beside the target rather than in it, and only a complete
+    // file is renamed over the real name. A transfer that dies part way
+    // therefore leaves the previous copy exactly as it was, instead of the
+    // truncated stump that opening the target directly would leave.
+    //
+    // Created writable whatever the sender's mode says; the writer applies the
+    // real permission bits once the contents are final.
+    let mode = entry.mode | 0o600;
+    let (file, name, final_name) = match sys::create_temp_file_at(dir.as_fd(), name, mode) {
+        Ok((file, temp)) => (file, temp, Some(name.to_string())),
+        // The prefix and suffix pushed an already long name past the
+        // filesystem's limit. Losing the atomic replace is better than
+        // refusing a file the sender can legitimately offer.
+        Err(err) if err.raw_os_error() == Some(libc::ENAMETOOLONG) => (
+            sys::create_file_at(dir.as_fd(), name, mode)?,
+            name.to_string(),
+            None,
+        ),
+        Err(err) => return Err(err),
+    };
     // Advisory only, and non-fatal on the sender too.
     let _ = sys::set_nocache(file.as_raw_fd());
     if let Some(diag) = sink.diag {
@@ -550,7 +642,8 @@ fn pump_file(
         // An Arc clone, not a dup: the writer only needs *a* handle on the
         // directory to unlink by name, and this one is already open.
         parent: Arc::clone(dir),
-        name: name.to_string(),
+        name,
+        final_name,
         mtime: entry.mtime,
         mode: entry.mode,
         finished: false,
@@ -636,6 +729,41 @@ mod tests {
         crate::wire::encode_handshake(0, token)
     }
 
+    /// The name the bytes actually land under, which is what the cleanup
+    /// assertions below are really about.
+    fn temp_name(name: &str) -> String {
+        format!(".{name}.tf-partial")
+    }
+
+    fn spawn_receiver(
+        dest: &Path,
+        token: [u8; TOKEN_LEN],
+    ) -> (u16, std::thread::JoinHandle<io::Result<Stats>>) {
+        let receiver = Receiver::bind(dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
+        let port = receiver.port().unwrap();
+        let handle = std::thread::spawn(move || {
+            let progress = Progress::new("receiving");
+            receiver.accept_one(&progress)
+        });
+        (port, handle)
+    }
+
+    /// Play the sender's half of the manifest phase: every header, the
+    /// terminator, then the receiver's bitmap read back.
+    fn manifest(stream: &mut TcpStream, entries: &[Entry]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for entry in entries {
+            entry.encode(&mut buf);
+        }
+        crate::wire::write_terminator(&mut buf).unwrap();
+        stream.write_all(&buf).unwrap();
+
+        let files = entries.iter().filter(|e| e.kind == Kind::File).count();
+        let mut bitmap = vec![0u8; files.div_ceil(8)];
+        stream.read_exact(&mut bitmap).unwrap();
+        bitmap
+    }
+
     #[test]
     fn rejects_a_bad_token() {
         let dest = scratch("bad-token");
@@ -675,38 +803,37 @@ mod tests {
         let outside = scratch("escape-outside");
         let token = [3u8; TOKEN_LEN];
 
-        let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
-        let port = receiver.port().unwrap();
-        let handle = std::thread::spawn(move || {
-            let progress = Progress::new("receiving");
-            receiver.accept_one(&progress)
-        });
-
+        let (port, handle) = spawn_receiver(&dest, token);
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         stream.write_all(&handshake(&token)).unwrap();
 
         // A symlink pointing outside, then a write "through" it. Both paths
         // pass every string-level rule.
         let target = outside.to_str().unwrap().to_string();
+        let entries = [
+            Entry {
+                kind: Kind::Symlink,
+                path: "x".into(),
+                size: target.len() as u64,
+                mode: 0o777,
+                mtime: 0,
+            },
+            Entry {
+                kind: Kind::File,
+                path: "x/escaped.txt".into(),
+                size: 5,
+                mode: 0o644,
+                mtime: 0,
+            },
+        ];
+        // The manifest stat must refuse the escape as flatly as the write does.
+        assert_eq!(manifest(&mut stream, &entries), vec![0u8]);
+
         let mut buf = Vec::new();
-        Entry {
-            kind: Kind::Symlink,
-            path: "x".into(),
-            size: target.len() as u64,
-            mode: 0o777,
-            mtime: 0,
-        }
-        .encode(&mut buf);
+        entries[0].encode(&mut buf);
         buf.extend_from_slice(target.as_bytes());
         buf.extend_from_slice(&crate::wire::digest(target.as_bytes()));
-        Entry {
-            kind: Kind::File,
-            path: "x/escaped.txt".into(),
-            size: 5,
-            mode: 0o644,
-            mtime: 0,
-        }
-        .encode(&mut buf);
+        entries[1].encode(&mut buf);
         buf.extend_from_slice(b"pwned");
         buf.extend_from_slice(&crate::wire::digest(b"pwned"));
         let _ = stream.write_all(&buf);
@@ -723,7 +850,8 @@ mod tests {
         Msg::Begin(InFlight {
             file,
             parent: Arc::new(root.try_clone().unwrap()),
-            name: name.to_string(),
+            name: temp_name(name),
+            final_name: Some(name.to_string()),
             mtime: 0,
             mode: 0o644,
             finished: false,
@@ -758,6 +886,8 @@ mod tests {
         let root = sys::open_dir(&dest).unwrap();
         let path = dest.join("unflushable.bin");
         std::fs::write(&path, b"placeholder").unwrap();
+        let temp = dest.join(temp_name("unflushable.bin"));
+        std::fs::write(&temp, b"").unwrap();
 
         let (tx, _pool, handle) = spawn_writer(1, 8, true);
         let (_reader, pipe) = std::io::pipe().unwrap();
@@ -775,7 +905,12 @@ mod tests {
             err.raw_os_error().is_some(),
             "expected an OS error, got {err}"
         );
-        assert!(!path.exists(), "an unflushed file must not survive");
+        assert!(!temp.exists(), "an unflushed file must not survive");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"placeholder",
+            "the copy already in place must be left alone"
+        );
         assert!(
             tx.send(Msg::EndFile).is_err(),
             "the writer must drop its receiver so the network thread stops"
@@ -793,16 +928,21 @@ mod tests {
         let (tx, rx) = sync_channel::<Msg>(1);
         drop(rx); // the writer died on an earlier file
 
-        let file = sys::create_file_at(root.as_fd(), "orphan.bin", 0o644).unwrap();
-        assert!(dest.join("orphan.bin").exists(), "setup: file must exist");
+        let temp = dest.join(temp_name("orphan.bin"));
+        let file = sys::create_file_at(root.as_fd(), &temp_name("orphan.bin"), 0o644).unwrap();
+        assert!(temp.exists(), "setup: file must exist");
 
         assert!(
             tx.send(begin(file, &root, "orphan.bin")).is_err(),
             "the writer is gone, so the send must fail"
         );
         assert!(
-            !dest.join("orphan.bin").exists(),
+            !temp.exists(),
             "a file the writer never took ownership of must not be left behind"
+        );
+        assert!(
+            !dest.join("orphan.bin").exists(),
+            "and it never reached the real name"
         );
     }
 
@@ -816,7 +956,7 @@ mod tests {
         let (tx, pool, handle) = spawn_writer(2, 8, false);
 
         let mut open = match begin(
-            sys::create_file_at(root.as_fd(), "ro.bin", 0o444 | 0o600).unwrap(),
+            sys::create_file_at(root.as_fd(), &temp_name("ro.bin"), 0o444 | 0o600).unwrap(),
             &root,
             "ro.bin",
         ) {
@@ -835,6 +975,10 @@ mod tests {
         let meta = std::fs::metadata(dest.join("ro.bin")).unwrap();
         assert_eq!(meta.len(), 8, "the writer must have written first");
         assert_eq!(meta.permissions().mode() & 0o777, 0o444);
+        assert!(
+            !dest.join(temp_name("ro.bin")).exists(),
+            "the rename must consume the temp name"
+        );
     }
 
     #[test]
@@ -862,6 +1006,9 @@ mod tests {
         let dest = scratch("backpressure");
         let root = sys::open_dir(&dest).unwrap();
         let (tx, pool, handle) = spawn_writer(1, MSG, false);
+        // The payload goes to the pipe, but EndFile still renames the temp
+        // name into place, so it has to exist.
+        std::fs::write(dest.join(temp_name("pipe")), b"").unwrap();
         let started = std::time::Instant::now();
 
         tx.send(begin(
@@ -904,6 +1051,8 @@ mod tests {
         let root = sys::open_dir(&dest).unwrap();
         let path = dest.join("doomed.bin");
         std::fs::write(&path, b"placeholder").unwrap();
+        let temp = dest.join(temp_name("doomed.bin"));
+        std::fs::write(&temp, b"").unwrap();
 
         let (tx, pool, handle) = spawn_writer(2, 16, false);
         // Read-only, so the writer's first write fails with EBADF.
@@ -921,7 +1070,12 @@ mod tests {
             err.raw_os_error().is_some(),
             "expected an OS error, got {err}"
         );
-        assert!(!path.exists(), "the partial file must be removed");
+        assert!(!temp.exists(), "the partial file must be removed");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"placeholder",
+            "the copy already in place must be left alone"
+        );
         assert!(
             tx.send(Msg::EndFile).is_err(),
             "the writer must drop its receiver so the network thread stops"
@@ -935,7 +1089,7 @@ mod tests {
         let (tx, pool, handle) = spawn_writer(2, 8, false);
 
         tx.send(begin(
-            sys::create_file_at(root.as_fd(), "half.bin", 0o644).unwrap(),
+            sys::create_file_at(root.as_fd(), &temp_name("half.bin"), 0o644).unwrap(),
             &root,
             "half.bin",
         ))
@@ -946,8 +1100,12 @@ mod tests {
 
         handle.join().unwrap().unwrap();
         assert!(
-            !dest.join("half.bin").exists(),
+            !dest.join(temp_name("half.bin")).exists(),
             "an unfinished file must not survive"
+        );
+        assert!(
+            !dest.join("half.bin").exists(),
+            "and it must never have reached the real name"
         );
     }
 
@@ -955,32 +1113,155 @@ mod tests {
     fn deletes_a_truncated_file_rather_than_keeping_a_partial() {
         let dest = scratch("truncated");
         let token = [5u8; TOKEN_LEN];
-        let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
-        let port = receiver.port().unwrap();
-        let handle = std::thread::spawn(move || {
-            let progress = Progress::new("receiving");
-            receiver.accept_one(&progress)
-        });
+        let (port, handle) = spawn_receiver(&dest, token);
 
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         stream.write_all(&handshake(&token)).unwrap();
-        let mut buf = Vec::new();
-        Entry {
+        let entry = Entry {
             kind: Kind::File,
             path: "half.bin".into(),
             size: 1000,
             mode: 0o644,
             mtime: 0,
-        }
-        .encode(&mut buf);
+        };
+        assert_eq!(
+            manifest(&mut stream, std::slice::from_ref(&entry)),
+            vec![0u8]
+        );
+
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
         buf.extend_from_slice(&[0u8; 400]);
         let _ = stream.write_all(&buf);
         drop(stream); // hang up mid-file
 
         assert!(handle.join().unwrap().is_err());
         assert!(
-            !dest.join("half.bin").exists(),
+            !dest.join(temp_name("half.bin")).exists(),
             "partial file must be removed"
         );
+        assert!(
+            !dest.join("half.bin").exists(),
+            "and no truncated file may appear under the real name"
+        );
+    }
+
+    /// The point of writing beside the target: a transfer that dies part way
+    /// through must leave the copy already on disk exactly as it was.
+    #[test]
+    fn an_existing_file_survives_a_transfer_that_fails_mid_file() {
+        let dest = scratch("survive-mid-file");
+        let path = dest.join("keep.bin");
+        std::fs::write(&path, b"original").unwrap();
+        let token = [13u8; TOKEN_LEN];
+        let (port, handle) = spawn_receiver(&dest, token);
+
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.write_all(&handshake(&token)).unwrap();
+        let entry = Entry {
+            kind: Kind::File,
+            path: "keep.bin".into(),
+            size: 1000,
+            mode: 0o644,
+            mtime: 0,
+        };
+        assert_eq!(
+            manifest(&mut stream, std::slice::from_ref(&entry)),
+            vec![0u8],
+            "a file of a different size is not one we have"
+        );
+
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
+        buf.extend_from_slice(&[7u8; 400]);
+        let _ = stream.write_all(&buf);
+        drop(stream);
+
+        assert!(handle.join().unwrap().is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"original",
+            "the previous file must outlive a failed transfer"
+        );
+        assert!(!dest.join(temp_name("keep.bin")).exists());
+    }
+
+    /// Repeat transfer of an unchanged tree: the manifest answers "have it"
+    /// and no byte of the file crosses the wire.
+    #[test]
+    fn the_manifest_marks_an_identical_file_as_already_held() {
+        let dest = scratch("manifest-have");
+        std::fs::write(dest.join("same.txt"), b"hello").unwrap();
+        let root = sys::open_dir(&dest).unwrap();
+        sys::set_mtime_at(root.as_fd(), "same.txt", 1_600_000_000).unwrap();
+
+        let token = [11u8; TOKEN_LEN];
+        let (port, handle) = spawn_receiver(&dest, token);
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.write_all(&handshake(&token)).unwrap();
+
+        let entry = Entry {
+            kind: Kind::File,
+            path: "same.txt".into(),
+            size: 5,
+            mode: 0o644,
+            mtime: 1_600_000_000,
+        };
+        assert_eq!(
+            manifest(&mut stream, std::slice::from_ref(&entry)),
+            vec![1u8]
+        );
+        // A sender told to skip its only file sends an empty data phase.
+        crate::wire::write_terminator(&mut stream).unwrap();
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], ACK);
+
+        let stats = handle.join().unwrap().unwrap();
+        assert_eq!(stats.skipped_files, 1);
+        assert_eq!(stats.skipped_bytes, 5);
+        assert_eq!(stats.files, 0, "nothing arrived in the data phase");
+        assert_eq!(std::fs::read(dest.join("same.txt")).unwrap(), b"hello");
+    }
+
+    /// Same name, same size, different mtime: the source changed, so it moves.
+    #[test]
+    fn the_manifest_asks_for_a_file_whose_mtime_differs() {
+        let dest = scratch("manifest-mtime");
+        std::fs::write(dest.join("drift.txt"), b"hello").unwrap();
+        let root = sys::open_dir(&dest).unwrap();
+        sys::set_mtime_at(root.as_fd(), "drift.txt", 1_600_000_000).unwrap();
+
+        let token = [17u8; TOKEN_LEN];
+        let (port, handle) = spawn_receiver(&dest, token);
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.write_all(&handshake(&token)).unwrap();
+
+        let entry = Entry {
+            kind: Kind::File,
+            path: "drift.txt".into(),
+            size: 5,
+            mode: 0o644,
+            mtime: 1_600_000_001,
+        };
+        assert_eq!(
+            manifest(&mut stream, std::slice::from_ref(&entry)),
+            vec![0u8]
+        );
+
+        let mut buf = Vec::new();
+        entry.encode(&mut buf);
+        buf.extend_from_slice(b"world");
+        buf.extend_from_slice(&crate::wire::digest(b"world"));
+        crate::wire::write_terminator(&mut buf).unwrap();
+        stream.write_all(&buf).unwrap();
+        let mut ack = [0u8; 1];
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(ack[0], ACK);
+
+        let stats = handle.join().unwrap().unwrap();
+        assert_eq!(stats.skipped_files, 0);
+        assert_eq!(stats.files, 1);
+        assert_eq!(std::fs::read(dest.join("drift.txt")).unwrap(), b"world");
     }
 }

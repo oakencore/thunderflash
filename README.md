@@ -69,17 +69,37 @@ By design, for now:
   mtime to one-second resolution. Xattrs, ACLs and resource forks are not, so
   `.app` bundles, Photos libraries and quarantine-flagged files will arrive
   subtly broken.
-- **No resume.** An interrupted transfer starts over — including one stopped
-  by a verification failure.
+- **No resume.** A part-sent file starts from zero, including one stopped by a
+  verification failure. Whole files already at the destination are skipped on
+  the retry (see Repeat transfers), so a big tree does not start over.
 - **No pull mode.** Push only.
+
+## Repeat transfers
+
+Each run opens with a manifest: the sender lists what it is about to send, the
+receiver answers with the files it already holds, and those never cross the
+wire. A file counts as held when both its size and its mtime match — the same
+quick check rsync makes by default. `tf` stamps the sender's mtime on every
+file it writes, so a second run over an unchanged tree moves nothing but the
+directory entries, and says how many files it skipped.
+
+Contents are not compared. A destination file edited to the same size and
+timestamp is left alone; delete it to force a fresh copy.
+
+Files are replaced atomically. The receiver writes to `.name.tf-partial`
+beside the target and renames over the real name only once the last byte has
+arrived and verified, so an interrupted transfer costs the temp file and never
+the copy that was already there. Names too long to carry the prefix and suffix
+(over 243 characters) are written in place instead, and those can still be
+lost to an interrupted run.
 
 ## Content verification
 
 Every file and symlink is verified end to end with BLAKE3. The sender hashes
 each chunk as it leaves the disk and puts the 32-byte digest on the wire after
 the payload; the receiver hashes the same bytes as they arrive and compares.
-Neither side reads the data twice. A mismatch deletes the destination file,
-fails with the offending path and withholds the acknowledgement, so the sender
+Neither side reads the data twice. A mismatch discards the partial file, fails
+with the offending path and withholds the acknowledgement, so the sender
 reports failure too.
 
 Verification is on by default and caps throughput at one BLAKE3 core (about
@@ -93,10 +113,11 @@ it on unless the link is genuinely faster than the hasher — on the 40 Gb/s
 link above it bought 39%; on slower links, or against a slow destination
 disk, it buys nothing.
 
-Both Macs must run the same protocol version (currently v2, which added the
-digests). Only the receiver parses a handshake, so only the receiving Mac
-names a mismatch (`sender speaks protocol v1, this build speaks v2`); the
-sending Mac just sees the connection close, as with a mistyped phrase.
+Both Macs must run the same protocol version (currently v3, which added the
+manifest exchange). Only the receiver parses a handshake, so only the
+receiving Mac names a mismatch (`sender speaks protocol v1, this build speaks
+v3`); the sending Mac just sees the connection close, as with a mistyped
+phrase.
 
 ## Durability
 
@@ -110,8 +131,8 @@ been flushed with `F_FULLFSYNC` (which asks the drive to empty its own write
 cache) and the destination root directory has been flushed too. A file is
 flushed after its mtime is stamped, so the timestamp is persisted with the
 contents. Where the filesystem does not support `F_FULLFSYNC`, `tf` falls back
-to `fsync` and prints one warning. Any other flush failure deletes the file
-and fails the transfer, the same as a write error.
+to `fsync` and prints one warning. Any other flush failure discards the
+partial file and fails the transfer, the same as a write error.
 
 `--durable` is no defence against hardware, firmware or filesystem corruption,
 or a drive that lies about its cache. Symlinks are not flushed, and

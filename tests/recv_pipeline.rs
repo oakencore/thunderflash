@@ -70,6 +70,11 @@ fn session_at(
     stream
         .write_all(&handshake_raw(&token, version, flags))
         .unwrap();
+    // These tests exercise the data phase, so they declare nothing in the
+    // manifest: an empty entry list means an empty bitmap, i.e. no reply bytes
+    // to read back, and the receiver skips nothing.
+    stream.write_all(&[Kind::End.to_u8()]).unwrap();
+    stream.flush().unwrap();
     (dest, stream, handle)
 }
 
@@ -199,6 +204,8 @@ fn a_repeat_transfer_overwrites_the_previous_contents() {
 
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         stream.write_all(&handshake(&token)).unwrap();
+        stream.write_all(&[Kind::End.to_u8()]).unwrap(); // empty manifest
+        stream.flush().unwrap();
 
         let payload = pattern(CHUNK + 17, seed);
         let writer = std::thread::spawn(move || {
@@ -447,9 +454,10 @@ fn a_no_verify_stream_carries_no_digests() {
     assert_eq!(std::fs::read(dest.join("zero.bin")).unwrap().len(), 0);
 }
 
-/// v1 and v2 refuse each other rather than misreading the other's framing.
+/// An older sender and this receiver refuse each other rather than
+/// misreading the other's framing.
 #[test]
-fn a_v1_sender_is_refused_by_a_v2_receiver() {
+fn a_v1_sender_is_refused_by_a_v3_receiver() {
     let (dest, mut stream, handle) = session_at("v1-sender", [31u8; TOKEN_LEN], 1, 0);
 
     let payload = b"abc";
@@ -462,7 +470,7 @@ fn a_v1_sender_is_refused_by_a_v2_receiver() {
     let err = handle.join().unwrap().unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(
-        err.to_string().contains("v1") && err.to_string().contains("v2"),
+        err.to_string().contains("v1") && err.to_string().contains("v3"),
         "the version error must name both versions: {err}"
     );
     assert!(!dest.join("old.bin").exists());

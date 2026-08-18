@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use thunderflash::awake;
 use thunderflash::iface::{self, Bridge};
 use thunderflash::phrase;
-use thunderflash::progress::{Diag, Progress};
+use thunderflash::progress::{self, Diag, Progress};
 use thunderflash::recv::Receiver;
 use thunderflash::send;
 
@@ -163,6 +163,17 @@ fn transmit(
     let _ = render.join();
     report(diag, started, true);
 
+    // The progress line only ever knew about what moved; without this a repeat
+    // transfer looks like it lost files rather than skipping them.
+    if let Ok(stats) = &result
+        && stats.skipped_files > 0
+    {
+        eprintln!(
+            "skipped {} files already on the receiver ({})",
+            stats.skipped_files,
+            progress::format_bytes(stats.skipped_bytes)
+        );
+    }
     result.map(|_| ())
 }
 
