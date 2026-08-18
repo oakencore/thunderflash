@@ -2,12 +2,15 @@ use std::io::{self, Write};
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use thunderflash::awake;
 use thunderflash::iface::{self, Bridge};
 use thunderflash::phrase;
-use thunderflash::progress::Progress;
+use thunderflash::progress::{Diag, Progress};
 use thunderflash::recv::Receiver;
 use thunderflash::send;
 
@@ -34,6 +37,12 @@ enum Command {
         /// TCP port. 0 picks any free port and advertises it via discovery.
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Print transfer diagnostics to stderr when the run ends.
+        #[arg(long)]
+        stats: bool,
+        /// Flush every received file to permanent storage before acknowledging.
+        #[arg(long)]
+        durable: bool,
     },
     /// Send files or directories to the Mac on the other end of the cable.
     Send {
@@ -45,6 +54,13 @@ enum Command {
         /// The three-word phrase shown by `tf recv`. Prompted for if omitted.
         #[arg(long)]
         token: Option<String>,
+        /// Print transfer diagnostics to stderr when the run ends.
+        #[arg(long)]
+        stats: bool,
+        /// Skip BLAKE3 content verification. Faster on links above ~2.5 GB/s;
+        /// corruption can then arrive undetected. See the README.
+        #[arg(long)]
+        no_verify: bool,
     },
 }
 
@@ -60,12 +76,23 @@ fn main() -> ExitCode {
 
 fn run() -> io::Result<()> {
     match Cli::parse().command {
-        Command::Recv { dir, port } => receive(dir, port),
-        Command::Send { paths, peer, token } => transmit(paths, peer, token),
+        Command::Recv {
+            dir,
+            port,
+            stats,
+            durable,
+        } => receive(dir, port, stats, durable),
+        Command::Send {
+            paths,
+            peer,
+            token,
+            stats,
+            no_verify,
+        } => transmit(paths, peer, token, stats, !no_verify),
     }
 }
 
-fn receive(dir: PathBuf, port: u16) -> io::Result<()> {
+fn receive(dir: PathBuf, port: u16, stats: bool, durable: bool) -> io::Result<()> {
     let bridge = iface::find_bridge(IFACE)?;
     warn_about_mtu(&bridge);
     let _awake = keep_awake();
@@ -74,7 +101,11 @@ fn receive(dir: PathBuf, port: u16) -> io::Result<()> {
     // so a wrong guess costs the attacker the whole session.
     let phrase = phrase::generate_phrase()?;
     let token = phrase::derive_token(&phrase);
-    let receiver = Receiver::bind(&dir, bridge.addr, port, token)?;
+    let diag = stats.then(|| Arc::new(Diag::default()));
+    let mut receiver = Receiver::bind(&dir, bridge.addr, port, token)?.with_durable(durable);
+    if let Some(diag) = &diag {
+        receiver = receiver.with_diag(Arc::clone(diag));
+    }
     let bound = receiver.port()?;
 
     std::thread::spawn(move || {
@@ -93,9 +124,11 @@ fn receive(dir: PathBuf, port: u16) -> io::Result<()> {
 
     let progress = Progress::new("receiving");
     let render = progress.start_render();
+    let started = Instant::now();
     let result = receiver.accept_one(&progress);
     progress.finish();
     let _ = render.join();
+    report(diag, started, false);
 
     result.map(|_| ())
 }
@@ -104,6 +137,8 @@ fn transmit(
     paths: Vec<PathBuf>,
     peer: Option<SocketAddrV4>,
     token: Option<String>,
+    stats: bool,
+    verify: bool,
 ) -> io::Result<()> {
     let bridge = iface::find_bridge(IFACE)?;
     warn_about_mtu(&bridge);
@@ -119,13 +154,26 @@ fn transmit(
         None => iface::find_peer(&bridge)?,
     };
 
+    let diag = stats.then(|| Arc::new(Diag::default()));
     let progress = Progress::new("sending");
     let render = progress.start_render();
-    let result = send::send_to(peer, &paths, &token, &progress);
+    let started = Instant::now();
+    let result = send::send_to_diag(peer, &paths, &token, &progress, verify, diag.clone());
     progress.finish();
     let _ = render.join();
+    report(diag, started, true);
 
     result.map(|_| ())
+}
+
+/// Timed out here rather than inside the transfer so a failed run still
+/// reports how long it ran for.
+fn report(diag: Option<Arc<Diag>>, started: Instant, sending: bool) {
+    if let Some(diag) = diag {
+        diag.total_nanos
+            .store(started.elapsed().as_nanos() as u64, Relaxed);
+        diag.report(sending);
+    }
 }
 
 fn prompt_for_phrase() -> io::Result<String> {

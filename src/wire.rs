@@ -11,14 +11,64 @@ use std::io::{self, Read, Write};
 
 /// "TFLS" — identifies our protocol on the first four bytes of a connection.
 pub const MAGIC: u32 = 0x5446_4C53;
-pub const VERSION: u8 = 1;
+/// v2 adds a BLAKE3 digest after every File and Symlink payload.
+pub const VERSION: u8 = 2;
 pub const TOKEN_LEN: usize = 32;
+/// MAGIC(4) VERSION(1) FLAGS(1) TOKEN(32).
+pub const HANDSHAKE_LEN: usize = 6 + TOKEN_LEN;
+/// Sender opted out of verification: the stream carries NO digest frames.
+pub const FLAG_NO_VERIFY: u8 = 0x01;
+/// Every bit this build understands. A sender setting anything else is
+/// speaking a framing we cannot parse, so the connection is refused.
+const KNOWN_FLAGS: u8 = FLAG_NO_VERIFY;
 /// Sent by the receiver once every entry is written, so the sender never
 /// reports success for data the receiver has not actually committed.
 pub const ACK: u8 = 0xFF;
 /// Read/write chunk size. Large enough that syscall overhead disappears
 /// against a multi-gigabit link. Shared so both ends agree.
 pub const CHUNK: usize = 4 * 1024 * 1024;
+/// Length of the BLAKE3 digest that follows every File and Symlink payload.
+pub const DIGEST_LEN: usize = 32;
+pub type Digest = [u8; DIGEST_LEN];
+
+/// A peer that has said nothing for this long is gone, not slow: both ends
+/// are on one cable and neither pauses mid-stream. Without it a silent peer
+/// pins the one-shot receiver (or the sender's ACK wait) forever, since
+/// nothing else ever times a TCP read out.
+pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// The handshake is 38 bytes written immediately after connect, so a real
+/// sender never needs longer.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound how long either end will block on a peer that has gone quiet.
+pub fn set_timeouts(stream: &std::net::TcpStream, timeout: std::time::Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
+}
+
+/// Chunk buffers in flight per side. Benchmark knob only — deliberately not a
+/// CLI flag, since the default is right for every link this tool targets.
+/// The receiver holds exactly this many CHUNK buffers; the sender holds two
+/// more (one being filled, one being written).
+const QUEUE_DEPTH: usize = 4;
+
+fn clamp_depth(raw: Option<&str>) -> usize {
+    match raw.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) => n.clamp(1, 64),
+        None => QUEUE_DEPTH,
+    }
+}
+
+pub fn queue_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| clamp_depth(std::env::var("TF_QUEUE_DEPTH").ok().as_deref()))
+}
+
+/// One-shot digest of a whole payload. The transfer paths hash incrementally
+/// as bytes pass through; this is for short payloads and for tests.
+pub fn digest(bytes: &[u8]) -> Digest {
+    *blake3::hash(bytes).as_bytes()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
@@ -57,9 +107,6 @@ pub struct Entry {
     pub size: u64,
     pub mode: u32,
     pub mtime: i64,
-    /// Always 0 in v1. Reserved so a future parallel-chunked sender is a
-    /// small delta rather than a wire format break.
-    pub offset: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,7 +123,6 @@ impl Entry {
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&self.mode.to_le_bytes());
         out.extend_from_slice(&self.mtime.to_le_bytes());
-        out.extend_from_slice(&self.offset.to_le_bytes());
     }
 
     /// Read one entry. Returns `Ok(None)` when the terminator is reached.
@@ -105,12 +151,19 @@ impl Entry {
 
         reader.read_exact(&mut u64_buf)?;
         let size = u64::from_le_bytes(u64_buf);
+        // A symlink target is a path, so it can never legitimately exceed
+        // PATH_MAX. Refused here rather than at the receiver's symlink arm,
+        // since `size` is the length it would allocate on the sender's say-so.
+        if kind == Kind::Symlink && size > MAX_PATH_LEN as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("symlink target of {size} bytes exceeds {MAX_PATH_LEN}"),
+            ));
+        }
         reader.read_exact(&mut u32_buf)?;
         let mode = u32::from_le_bytes(u32_buf);
         reader.read_exact(&mut u64_buf)?;
         let mtime = i64::from_le_bytes(u64_buf);
-        reader.read_exact(&mut u64_buf)?;
-        let offset = u64::from_le_bytes(u64_buf);
 
         Ok(Some(Entry {
             kind,
@@ -118,9 +171,46 @@ impl Entry {
             size,
             mode,
             mtime,
-            offset,
         }))
     }
+}
+
+pub fn encode_handshake(flags: u8, token: &[u8; TOKEN_LEN]) -> [u8; HANDSHAKE_LEN] {
+    let mut buf = [0u8; HANDSHAKE_LEN];
+    buf[..4].copy_from_slice(&MAGIC.to_le_bytes());
+    buf[4] = VERSION;
+    buf[5] = flags;
+    buf[6..].copy_from_slice(token);
+    buf
+}
+
+/// Parse a handshake into its flags and token. Rejects a foreign protocol, a
+/// version we do not speak, and any flag bit we do not understand — all before
+/// the token is even compared, since none of them can be honoured.
+pub fn decode_handshake(buf: &[u8; HANDSHAKE_LEN]) -> io::Result<(u8, [u8; TOKEN_LEN])> {
+    if u32::from_le_bytes(buf[..4].try_into().unwrap()) != MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a thunderflash sender",
+        ));
+    }
+    if buf[4] != VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "sender speaks protocol v{}, this build speaks v{VERSION}",
+                buf[4]
+            ),
+        ));
+    }
+    let flags = buf[5];
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sender set unknown handshake flags 0x{flags:02x}"),
+        ));
+    }
+    Ok((flags, buf[6..].try_into().unwrap()))
 }
 
 pub fn write_terminator(writer: &mut impl Write) -> io::Result<()> {
@@ -143,7 +233,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Maximum accepted path length in bytes. Comfortably above any real path,
 /// low enough that a hostile sender cannot make us allocate wildly.
-const MAX_PATH_LEN: usize = 4096;
+pub const MAX_PATH_LEN: usize = 4096;
 
 /// Split a sender-supplied relative path into components, rejecting anything
 /// that could escape the destination directory at the string level.
@@ -244,7 +334,6 @@ mod tests {
             size: 4_294_967_296,
             mode: 0o644,
             mtime: 1_755_400_000,
-            offset: 0,
         };
         assert_eq!(roundtrip(&entry), entry);
     }
@@ -257,7 +346,6 @@ mod tests {
             size: 0,
             mode: 0o600,
             mtime: 0,
-            offset: 0,
         };
         assert_eq!(roundtrip(&entry), entry);
     }
@@ -270,7 +358,6 @@ mod tests {
             size: 0,
             mode: 0o755,
             mtime: 1_755_400_000,
-            offset: 0,
         };
         assert_eq!(roundtrip(&entry), entry);
     }
@@ -283,7 +370,6 @@ mod tests {
             size: 24,
             mode: 0o777,
             mtime: 1_755_400_000,
-            offset: 0,
         };
         assert_eq!(roundtrip(&entry), entry);
     }
@@ -296,7 +382,6 @@ mod tests {
             size: 1,
             mode: 0o644,
             mtime: -86_400,
-            offset: 0,
         };
         assert_eq!(roundtrip(&entry), entry);
     }
@@ -323,9 +408,123 @@ mod tests {
         buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&0i64.to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
         let mut cursor = std::io::Cursor::new(buf);
         assert!(Entry::decode(&mut cursor).is_err());
+    }
+
+    /// A hostile sender announcing a huge symlink target must be refused at
+    /// decode, before anyone allocates on its say-so.
+    #[test]
+    fn decode_rejects_a_symlink_target_larger_than_a_path() {
+        let mut buf = Vec::new();
+        Entry {
+            kind: Kind::Symlink,
+            path: "x".into(),
+            size: u64::MAX,
+            mode: 0o777,
+            mtime: 0,
+        }
+        .encode(&mut buf);
+        let err = Entry::decode(&mut std::io::Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        // A target right at the bound is still legal.
+        let mut buf = Vec::new();
+        Entry {
+            kind: Kind::Symlink,
+            path: "x".into(),
+            size: MAX_PATH_LEN as u64,
+            mode: 0o777,
+            mtime: 0,
+        }
+        .encode(&mut buf);
+        assert!(Entry::decode(&mut std::io::Cursor::new(buf)).is_ok());
+    }
+
+    /// A File entry keeps its full u64 size: files really are that big.
+    #[test]
+    fn decode_still_accepts_a_huge_file_size() {
+        let mut buf = Vec::new();
+        Entry {
+            kind: Kind::File,
+            path: "big".into(),
+            size: 1 << 45,
+            mode: 0o644,
+            mtime: 0,
+        }
+        .encode(&mut buf);
+        assert!(Entry::decode(&mut std::io::Cursor::new(buf)).is_ok());
+    }
+
+    #[test]
+    fn queue_depth_env_override_is_clamped() {
+        assert_eq!(clamp_depth(None), QUEUE_DEPTH);
+        assert_eq!(clamp_depth(Some("garbage")), QUEUE_DEPTH);
+        assert_eq!(clamp_depth(Some("0")), 1);
+        assert_eq!(clamp_depth(Some(" 16 ")), 16);
+        assert_eq!(clamp_depth(Some("9999")), 64);
+    }
+
+    /// The empty-input digest is a fixed BLAKE3 constant, so a zero-length
+    /// file still has something meaningful to verify.
+    #[test]
+    fn digest_of_empty_input_is_the_known_blake3_constant() {
+        let expected =
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262".to_string();
+        let hex: String = digest(b"").iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, expected);
+    }
+
+    #[test]
+    fn digest_changes_when_a_single_byte_changes() {
+        let mut data = vec![7u8; CHUNK + 1];
+        let before = digest(&data);
+        data[CHUNK / 2] ^= 1;
+        assert_ne!(digest(&data), before);
+        assert_eq!(before.len(), DIGEST_LEN);
+    }
+
+    /// The receiver hashes chunk by chunk; that must equal the one-shot digest
+    /// the `digest` helper (and the tests) produce.
+    #[test]
+    fn incremental_hashing_matches_the_one_shot_digest() {
+        let data: Vec<u8> = (0..CHUNK * 2 + 9).map(|i| (i % 251) as u8).collect();
+        let mut hasher = blake3::Hasher::new();
+        for chunk in data.chunks(CHUNK) {
+            hasher.update(chunk);
+        }
+        assert_eq!(*hasher.finalize().as_bytes(), digest(&data));
+    }
+
+    #[test]
+    fn handshake_round_trips_flags_and_token() {
+        let token = [0xA5u8; TOKEN_LEN];
+        for flags in [0, FLAG_NO_VERIFY] {
+            let buf = encode_handshake(flags, &token);
+            assert_eq!(decode_handshake(&buf).unwrap(), (flags, token));
+        }
+    }
+
+    #[test]
+    fn handshake_rejects_an_unknown_flag_bit() {
+        let mut buf = encode_handshake(FLAG_NO_VERIFY, &[1u8; TOKEN_LEN]);
+        buf[5] |= 0x80;
+        let err = decode_handshake(&buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unknown handshake flags"), "{err}");
+    }
+
+    #[test]
+    fn handshake_rejects_a_foreign_magic_and_a_wrong_version() {
+        let mut buf = encode_handshake(0, &[1u8; TOKEN_LEN]);
+        buf[0] ^= 0xFF;
+        assert!(decode_handshake(&buf).is_err());
+
+        let mut buf = encode_handshake(0, &[1u8; TOKEN_LEN]);
+        buf[4] = 1;
+        let err = decode_handshake(&buf).unwrap_err();
+        assert!(err.to_string().contains("v1"), "{err}");
     }
 
     #[test]
