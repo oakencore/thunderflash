@@ -89,10 +89,14 @@ Confirm jumbo frames actually pass before re-running
 commands with 1500, members last). Neither setting persists across a reboot,
 and `tf` never changes it itself — it only prints a hint when it sees 1500.
 
-### Measured: two M-series MacBook Pros, Thunderbolt 5 cable (2026-08-18)
+### Measured: M5 MacBook Pro to M4 MacBook Pro (2026-08-18)
 
-29.7 GB of real media files (39 files, 5 dirs), sender an M5 Max. Single runs;
-`--stats` on both ends.
+A mixed pair — the M5 side is Thunderbolt 5, the M4 side Thunderbolt 4 — so
+the link negotiated **40 Gb/s** (TB4 mode; confirmed with
+`system_profiler SPThunderboltDataType`, which reports the unused TB5 ports
+as "Up to 120 Gb/s" and the connected one as "40 Gb/s"). A TB5-to-TB5 pair
+remains unmeasured. 29.7 GB of real media files (39 files, 5 dirs), sender
+the M5 Max. Single runs; `--stats` on both ends.
 
 | mode | MTU | elapsed | throughput | sender CPU (user+sys) |
 | --- | --- | --- | --- | --- |

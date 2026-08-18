@@ -203,7 +203,7 @@ fn keep_awake() -> Option<awake::KeepAwake> {
     }
 }
 
-/// Jumbo frames measured no gain on a TB5-class pair, but may still help
+/// Jumbo frames measured no gain on a 40 Gb/s pair, but may still help
 /// older links. Changing network configuration is the user's call, not ours —
 /// and macOS refuses an MTU on bridge0 until its members are raised first.
 fn warn_about_mtu(bridge: &Bridge) {

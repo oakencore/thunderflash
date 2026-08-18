@@ -41,14 +41,15 @@ sleeps the machine, so keep the lids open.
 
 ## Speed
 
-`tf` prints live throughput. Measured between two M-series MacBook Pros over
-a Thunderbolt 5 cable, sending 29.7 GB of real media files:
+`tf` prints live throughput. Measured between an M5 MacBook Pro and an M4
+MacBook Pro — a mixed pair, so the link negotiated Thunderbolt 4 at 40 Gb/s —
+sending 29.7 GB of real media files:
 
 - default (BLAKE3-verified): **2.3 GB/s**, limited by one hashing core per side
 - `--no-verify`: **3.7 GB/s**, limited by disk/link; sender CPU is near zero
 
-On a Thunderbolt 4 link expect roughly 1.2–2.5 GB/s either way — there the
-cable is slower than the hasher, so verification costs nothing.
+So even a Thunderbolt 4 link outruns the hasher; a TB5-to-TB5 pair
+(80 Gb/s) is unmeasured and can only widen the gap.
 
 Jumbo frames (MTU 9000 on both Macs) measured no difference on the pair
 above. To try them anyway: macOS refuses `mtu 9000` on `bridge0` directly —
@@ -94,9 +95,10 @@ The sender announces this in the handshake and the receiver prints
 
 The trade-off is real: TCP's 16-bit checksum is weak, so a `--no-verify`
 transfer can deliver silently corrupted bytes and still report success. Leave
-it on unless the link is genuinely faster than the hasher — on anything up to
-a TB4 cable (about 2.5 GB/s) verification is free, and only a TB5-class link
-where the wire outruns one BLAKE3 core has anything to gain.
+it on unless the link is genuinely faster than the hasher. Measured on a
+40 Gb/s Thunderbolt 4 link the wire does outrun one BLAKE3 core (3.7 vs
+2.3 GB/s), so `--no-verify` bought 39% there; on slower links (Thunderbolt 3,
+USB4 at 20 Gb/s) or against a slow destination disk, verification is free.
 
 Both Macs must run the same protocol version (currently v2, which added the
 digests). Only the receiver parses a handshake, so it is the receiving Mac that
