@@ -203,13 +203,14 @@ fn keep_awake() -> Option<awake::KeepAwake> {
     }
 }
 
-/// Jumbo frames are worth real throughput at multi-gigabit rates, but
-/// changing network configuration is the user's call, not ours.
+/// Jumbo frames measured no gain on a TB5-class pair, but may still help
+/// older links. Changing network configuration is the user's call, not ours —
+/// and macOS refuses an MTU on bridge0 until its members are raised first.
 fn warn_about_mtu(bridge: &Bridge) {
     if bridge.mtu == Some(1500) {
         eprintln!(
-            "hint: {IFACE} MTU is 1500. For more throughput, run this on BOTH Macs:\n  \
-             sudo ifconfig {IFACE} mtu 9000"
+            "hint: {IFACE} MTU is 1500. Jumbo frames may help older links: set mtu 9000 \
+             on each member interface (ifconfig {IFACE} | grep member), then {IFACE}, on BOTH Macs."
         );
     }
 }

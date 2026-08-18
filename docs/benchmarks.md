@@ -74,20 +74,38 @@ between runs, or the receiver is overwriting files rather than creating them.
 
 ### MTU
 
-Default is 1500. Measure that first, then raise it on **both** Macs:
+Default is 1500. Measure that first, then raise it on **both** Macs. macOS
+rejects `mtu 9000` on `bridge0` while its members are at 1500, so set the
+members first:
 
 ```sh
+ifconfig bridge0 | grep member       # e.g. en1 en2 en6
+sudo ifconfig en1 mtu 9000           # repeat for each member
 sudo ifconfig bridge0 mtu 9000
 ```
 
-Re-run the same transfer. Revert when done:
+Confirm jumbo frames actually pass before re-running
+(`ping -D -s 8000 <peer>`), re-run the same transfer, then revert (same
+commands with 1500, members last). Neither setting persists across a reboot,
+and `tf` never changes it itself — it only prints a hint when it sees 1500.
 
-```sh
-sudo ifconfig bridge0 mtu 1500
-```
+### Measured: two M-series MacBook Pros, Thunderbolt 5 cable (2026-08-18)
 
-Neither setting persists across a reboot, and `tf` never changes it itself —
-it only prints a hint when it sees 1500.
+29.7 GB of real media files (39 files, 5 dirs), sender an M5 Max. Single runs;
+`--stats` on both ends.
+
+| mode | MTU | elapsed | throughput | sender CPU (user+sys) |
+| --- | --- | --- | --- | --- |
+| verified (default) | 1500 | 13.0 s | 2.28 GB/s | 12.09 + 2.72 s |
+| `--no-verify` | 1500 | 7.9 s | 3.73 GB/s | 0.01 + 2.70 s |
+| `--no-verify` | 9000 | 8.1 s | 3.64 GB/s | 0.01 + 2.61 s |
+
+Verified throughput sits on the single-core BLAKE3 ceiling (~2.4 GB/s — the
+sender spent 12.19 s of the 13.0 s hashing, with 6,987 pool stalls showing
+backpressure holding the reader). `--no-verify` runs at the disk/link limit
+with essentially zero sender user CPU and zero pool stalls. Jumbo frames
+changed nothing measurable on this pair: the ~3.7 GB/s ceiling is not
+per-packet overhead. Peak sender RSS was 28 MB in every run.
 
 ## What these numbers are not
 

@@ -41,16 +41,20 @@ sleeps the machine, so keep the lids open.
 
 ## Speed
 
-`tf` prints live throughput. On a Thunderbolt 4 link expect roughly
-1.2–2.5 GB/s. If the number is well below that, try jumbo frames on **both**
-Macs:
+`tf` prints live throughput. Measured between two M-series MacBook Pros over
+a Thunderbolt 5 cable, sending 29.7 GB of real media files:
 
-```sh
-sudo ifconfig bridge0 mtu 9000
-```
+- default (BLAKE3-verified): **2.3 GB/s**, limited by one hashing core per side
+- `--no-verify`: **3.7 GB/s**, limited by disk/link; sender CPU is near zero
 
-This does not persist across reboots. `tf` prints a reminder when it sees an
-MTU of 1500 but never changes network settings itself.
+On a Thunderbolt 4 link expect roughly 1.2–2.5 GB/s either way — there the
+cable is slower than the hasher, so verification costs nothing.
+
+Jumbo frames (MTU 9000 on both Macs) measured no difference on the pair
+above. To try them anyway: macOS refuses `mtu 9000` on `bridge0` directly —
+set it on each member interface first (`ifconfig bridge0 | grep member`),
+then on `bridge0`, on both Macs. The setting does not survive a reboot, and
+`tf` never changes network settings itself.
 
 ## What it does not do
 
