@@ -140,6 +140,77 @@ pub fn walk_dirs(root: BorrowedFd, components: &[&str]) -> io::Result<OwnedFd> {
     Ok(current)
 }
 
+/// Size and mtime of a regular file under `root`, creating nothing.
+///
+/// Same escape-prevention discipline as `walk_dirs` — every component opened
+/// O_NOFOLLOW, the leaf stat'd AT_SYMLINK_NOFOLLOW — minus the mkdir, because
+/// the manifest check must not leave a trace of a file it decides against.
+/// Anything that is not a plain file (missing, a symlink, a directory) is an
+/// error, since the only caller treats every failure the same way: we do not
+/// have this, so send it.
+pub fn stat_regular_file(root: BorrowedFd, components: &[&str]) -> io::Result<(u64, i64)> {
+    let (name, parents) = components
+        .split_last()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty path"))?;
+    let mut current = root.try_clone_to_owned()?;
+    for component in parents {
+        current = open_dir_at(current.as_fd(), component)?;
+    }
+    let name = cstr(name)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            current.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((st.st_size as u64, st.st_mtime as i64))
+}
+
+/// Create the scratch file a payload lands in before it is renamed into place,
+/// and report the name it got.
+///
+/// The name has to be one the sender cannot also be sending. A source tree
+/// holding both `foo` and a file literally called `.foo.tf-partial` would
+/// otherwise put two different inodes through the same directory entry, and
+/// whichever rename ran last would decide which of the two survived — under
+/// the wrong name, with every digest still matching. The random middle puts
+/// the name out of a sender's reach, and O_EXCL turns the collision that is
+/// left into an error instead of a silent truncation.
+pub fn create_temp_file_at(dir: BorrowedFd, name: &str, mode: u32) -> io::Result<(File, String)> {
+    for _ in 0..4 {
+        let temp = format!(".{name}.{:08x}.tf-partial", unsafe { libc::arc4random() });
+        let cname = cstr(&temp)?;
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        };
+        if fd != -1 {
+            return Ok((unsafe { File::from_raw_fd(fd) }, temp));
+        }
+        let err = last_error();
+        if err.raw_os_error() != Some(libc::EEXIST) {
+            return Err(err);
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::EEXIST))
+}
+
 pub fn create_file_at(dir: BorrowedFd, name: &str, mode: u32) -> io::Result<File> {
     let cname = cstr(name)?;
     let open = || unsafe {
@@ -171,6 +242,17 @@ pub fn symlink_at(target: &str, dir: BorrowedFd, name: &str) -> io::Result<()> {
     let target = cstr(target)?;
     let name = cstr(name)?;
     let rc = unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// Move an entry to another name in the same directory, replacing whatever is
+/// there in one step. Both names are relative to `dir`, so nothing can be
+/// redirected by a symlinked parent between the two.
+pub fn rename_at(dir: BorrowedFd, from: &str, to: &str) -> io::Result<()> {
+    let from = cstr(from)?;
+    let to = cstr(to)?;
+    let rc =
+        unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -313,6 +395,66 @@ mod tests {
                 .unwrap(),
             "../elsewhere"
         );
+    }
+
+    #[test]
+    fn rename_at_replaces_an_existing_file() {
+        let root = scratch("rename-replace");
+        std::fs::write(root.join(".f.txt.tf-partial"), b"new").unwrap();
+        std::fs::write(root.join("f.txt"), b"old").unwrap();
+
+        let root_fd = open_dir(&root).unwrap();
+        rename_at(root_fd.as_fd(), ".f.txt.tf-partial", "f.txt").unwrap();
+
+        assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"new");
+        assert!(!root.join(".f.txt.tf-partial").exists());
+    }
+
+    /// Replacing needs write permission on the directory, not on the file
+    /// being replaced — which is why the temp-then-rename path does not need
+    /// the unlink retry that opening a read-only file for writing does.
+    #[test]
+    fn rename_at_replaces_a_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("rename-readonly");
+        let path = root.join("locked.bin");
+        std::fs::write(root.join(".locked.bin.tf-partial"), b"new").unwrap();
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let root_fd = open_dir(&root).unwrap();
+        rename_at(root_fd.as_fd(), ".locked.bin.tf-partial", "locked.bin").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn stat_regular_file_reports_size_and_mtime() {
+        let root = scratch("stat-regular");
+        std::fs::write(root.join("f.bin"), b"12345").unwrap();
+        let root_fd = open_dir(&root).unwrap();
+        set_mtime_at(root_fd.as_fd(), "f.bin", 1_600_000_000).unwrap();
+
+        assert_eq!(
+            stat_regular_file(root_fd.as_fd(), &["f.bin"]).unwrap(),
+            (5, 1_600_000_000)
+        );
+    }
+
+    /// The manifest check must never be talked into stat'ing the far end of a
+    /// symlink, at the leaf or at any component along the way.
+    #[test]
+    fn stat_regular_file_refuses_symlinks_and_missing_paths() {
+        let root = scratch("stat-symlink");
+        let outside = scratch("stat-symlink-outside");
+        std::fs::write(outside.join("victim.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink(outside.join("victim.txt"), root.join("leaf")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let root_fd = open_dir(&root).unwrap();
+        assert!(stat_regular_file(root_fd.as_fd(), &["leaf"]).is_err());
+        assert!(stat_regular_file(root_fd.as_fd(), &["escape", "victim.txt"]).is_err());
+        assert!(stat_regular_file(root_fd.as_fd(), &["absent"]).is_err());
     }
 
     #[test]

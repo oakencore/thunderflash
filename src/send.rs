@@ -12,7 +12,7 @@ use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
     ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN,
-    encode_handshake, queue_depth, set_timeouts, write_terminator,
+    encode_handshake, queue_depth, read_bitmap, set_timeouts, write_terminator,
 };
 
 pub struct Item {
@@ -202,8 +202,6 @@ pub fn send_to_diag(
     if let Some(diag) = &diag {
         add_elapsed(&diag.walk_nanos, started);
     }
-    let total_bytes: u64 = items.iter().map(|i| i.entry.size).sum();
-    progress.set_totals(items.len() as u64, total_bytes);
 
     let mut stream = TcpStream::connect(peer)?;
     sys::set_socket_buffers(stream.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
@@ -215,6 +213,26 @@ pub fn send_to_diag(
 
     let flags = if verify { 0 } else { FLAG_NO_VERIFY };
     stream.write_all(&encode_handshake(flags, token))?;
+
+    // Manifest phase. Every header travels first, in one write, so the
+    // receiver can answer with the files it already holds. Only File entries
+    // are offered: a directory is EEXIST-tolerant on the far side and a
+    // symlink target is smaller than the bit that would describe it.
+    let mut manifest = Vec::new();
+    for item in &items {
+        item.entry.encode(&mut manifest);
+    }
+    write_terminator(&mut manifest)?;
+    stream.write_all(&manifest)?;
+    stream.flush()?;
+    let offered = items.iter().filter(|i| i.entry.kind == Kind::File).count();
+    let have = read_bitmap(&mut stream, offered)?;
+
+    let (items, mut stats) = keep_unskipped(items, &have);
+    // Totals only now: the bar would otherwise promise bytes the manifest has
+    // already established will never move.
+    let total_bytes: u64 = items.iter().map(|i| i.entry.size).sum();
+    progress.set_totals(items.len() as u64, total_bytes);
 
     let depth = queue_depth();
     // One buffer per queue slot, plus one being filled by the reader and one
@@ -265,7 +283,6 @@ pub fn send_to_diag(
     // returns. If the reader leaves first it drops `tx`, this loop sees the
     // channel close, and we fall through to the join. Neither side can be
     // left blocked on a channel the other still holds.
-    let mut stats = Stats::default();
     for message in rx {
         match message? {
             Msg::Header(bytes) => {
@@ -326,6 +343,31 @@ pub fn send_to_diag(
         ));
     }
     Ok(stats)
+}
+
+/// Drop the files the receiver says it already has, counting them as skipped.
+/// Bits line up with File entries in wire order — the only entries that were
+/// offered — so anything else passes through untouched.
+fn keep_unskipped(items: Vec<Item>, have: &[bool]) -> (Vec<Item>, Stats) {
+    let mut stats = Stats::default();
+    let mut bits = have.iter();
+    let kept = items
+        .into_iter()
+        .filter(|item| {
+            if item.entry.kind != Kind::File {
+                return true;
+            }
+            // A short answer leaves the remainder unskipped: slower, never
+            // wrong.
+            if bits.next() == Some(&true) {
+                stats.skipped_files += 1;
+                stats.skipped_bytes += item.entry.size;
+                return false;
+            }
+            true
+        })
+        .collect();
+    (kept, stats)
 }
 
 fn read_items(
@@ -609,6 +651,63 @@ mod tests {
             .expect("a changed symlink must produce an error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("changed during transfer"), "{err}");
+    }
+
+    fn item(kind: Kind, path: &str, size: u64) -> Item {
+        Item {
+            abs: PathBuf::from(path),
+            entry: Entry {
+                kind,
+                path: path.to_string(),
+                size,
+                mode: 0o644,
+                mtime: 0,
+            },
+        }
+    }
+
+    fn kept_paths(items: &[Item]) -> Vec<&str> {
+        items.iter().map(|i| i.entry.path.as_str()).collect()
+    }
+
+    #[test]
+    fn the_bitmap_drops_only_the_files_the_receiver_already_has() {
+        let items = vec![
+            item(Kind::File, "a", 10),
+            item(Kind::File, "b", 20),
+            item(Kind::File, "c", 30),
+        ];
+        let (kept, stats) = keep_unskipped(items, &[true, false, true]);
+
+        assert_eq!(kept_paths(&kept), vec!["b"]);
+        assert_eq!(stats.skipped_files, 2);
+        assert_eq!(stats.skipped_bytes, 40);
+    }
+
+    /// Dirs and symlinks are never offered, so they consume no bits and must
+    /// survive however the file bits fall.
+    #[test]
+    fn dirs_and_symlinks_are_kept_and_consume_no_bits() {
+        let items = vec![
+            item(Kind::Dir, "d", 0),
+            item(Kind::File, "d/a", 7),
+            item(Kind::Symlink, "d/l", 3),
+            item(Kind::File, "d/b", 9),
+        ];
+        let (kept, stats) = keep_unskipped(items, &[true, false]);
+
+        assert_eq!(kept_paths(&kept), vec!["d", "d/l", "d/b"]);
+        assert_eq!(stats.skipped_files, 1);
+        assert_eq!(stats.skipped_bytes, 7);
+    }
+
+    #[test]
+    fn an_all_zero_bitmap_keeps_everything() {
+        let items = vec![item(Kind::File, "a", 1), item(Kind::File, "b", 2)];
+        let (kept, stats) = keep_unskipped(items, &[false, false]);
+
+        assert_eq!(kept_paths(&kept), vec!["a", "b"]);
+        assert_eq!(stats, Stats::default());
     }
 
     #[test]

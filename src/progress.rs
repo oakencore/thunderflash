@@ -71,6 +71,13 @@ impl Progress {
         self.shared.files.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn totals(&self) -> (u64, u64) {
+        (
+            self.shared.total_files.load(Ordering::Relaxed),
+            self.shared.total_bytes.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn snapshot(&self) -> (u64, u64) {
         (
             self.shared.files.load(Ordering::Relaxed),

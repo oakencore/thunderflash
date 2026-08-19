@@ -11,8 +11,10 @@ use std::io::{self, Read, Write};
 
 /// "TFLS" — identifies our protocol on the first four bytes of a connection.
 pub const MAGIC: u32 = 0x5446_4C53;
-/// v2 adds a BLAKE3 digest after every File and Symlink payload.
-pub const VERSION: u8 = 2;
+/// v3 adds a manifest phase: the entry list travels first, the receiver
+/// answers with a bitmap of the files it already has, and the data phase
+/// omits those entirely.
+pub const VERSION: u8 = 3;
 pub const TOKEN_LEN: usize = 32;
 /// MAGIC(4) VERSION(1) FLAGS(1) TOKEN(32).
 pub const HANDSHAKE_LEN: usize = 6 + TOKEN_LEN;
@@ -113,6 +115,10 @@ pub struct Entry {
 pub struct Stats {
     pub files: u64,
     pub bytes: u64,
+    /// Files the receiver already had, so nothing moved for them. Counted on
+    /// both sides from the same bitmap.
+    pub skipped_files: u64,
+    pub skipped_bytes: u64,
 }
 
 impl Entry {
@@ -215,6 +221,27 @@ pub fn decode_handshake(buf: &[u8; HANDSHAKE_LEN]) -> io::Result<(u8, [u8; TOKEN
 
 pub fn write_terminator(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(&[Kind::End.to_u8()])
+}
+
+/// Pack one bit per File entry, in wire order, LSB-first within each byte.
+///
+/// The length is implied: both ends counted the same File entries out of the
+/// manifest, so only the bits travel.
+pub fn encode_bitmap(bits: &[bool]) -> Vec<u8> {
+    let mut out = vec![0u8; bits.len().div_ceil(8)];
+    for (i, &bit) in bits.iter().enumerate() {
+        if bit {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
+/// Read the bitmap answering a manifest of `n` File entries.
+pub fn read_bitmap(reader: &mut impl Read, n: usize) -> io::Result<Vec<bool>> {
+    let mut bytes = vec![0u8; n.div_ceil(8)];
+    reader.read_exact(&mut bytes)?;
+    Ok((0..n).map(|i| bytes[i / 8] >> (i % 8) & 1 == 1).collect())
 }
 
 /// Compare two byte slices without leaking their contents through timing.
@@ -525,6 +552,57 @@ mod tests {
         buf[4] = 1;
         let err = decode_handshake(&buf).unwrap_err();
         assert!(err.to_string().contains("v1"), "{err}");
+    }
+
+    fn bitmap_roundtrip(bits: &[bool]) -> Vec<bool> {
+        let bytes = encode_bitmap(bits);
+        assert_eq!(bytes.len(), bits.len().div_ceil(8));
+        read_bitmap(&mut std::io::Cursor::new(bytes), bits.len()).unwrap()
+    }
+
+    #[test]
+    fn bitmap_round_trips_a_whole_number_of_bytes() {
+        let bits: Vec<bool> = (0..16).map(|i| i % 3 == 0).collect();
+        assert_eq!(bitmap_roundtrip(&bits), bits);
+    }
+
+    #[test]
+    fn bitmap_round_trips_a_length_that_is_not_a_multiple_of_eight() {
+        for n in [1, 7, 9, 15, 100] {
+            let bits: Vec<bool> = (0..n).map(|i| i % 5 < 2).collect();
+            assert_eq!(bitmap_roundtrip(&bits), bits, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn bitmap_of_no_files_is_zero_bytes() {
+        assert!(encode_bitmap(&[]).is_empty());
+        assert_eq!(bitmap_roundtrip(&[]), Vec::<bool>::new());
+    }
+
+    /// LSB-first within each byte: entry 0 is bit 0 of byte 0.
+    #[test]
+    fn bitmap_packs_the_first_entry_into_the_lowest_bit() {
+        assert_eq!(
+            encode_bitmap(&[true, false, false, false]),
+            vec![0b0000_0001]
+        );
+        assert_eq!(encode_bitmap(&[false; 8]), vec![0u8]);
+        assert_eq!(encode_bitmap(&[true; 9]), vec![0xFF, 0b0000_0001]);
+    }
+
+    /// The padding bits of a short final byte carry no entries, so whatever a
+    /// peer leaves in them must not become extra answers.
+    #[test]
+    fn bitmap_ignores_padding_bits_in_the_final_byte() {
+        let bits = read_bitmap(&mut std::io::Cursor::new(vec![0xFFu8]), 3).unwrap();
+        assert_eq!(bits, vec![true, true, true]);
+    }
+
+    #[test]
+    fn read_bitmap_fails_on_a_truncated_reply() {
+        let err = read_bitmap(&mut std::io::Cursor::new(vec![0u8]), 9).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

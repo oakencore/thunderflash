@@ -1,11 +1,14 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use thunderflash::progress::Progress;
 use thunderflash::recv::Receiver;
-use thunderflash::send;
-use thunderflash::wire::TOKEN_LEN;
+use thunderflash::wire::{Stats, TOKEN_LEN};
+use thunderflash::{send, sys};
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tf-e2e-{}-{}", name, std::process::id()));
@@ -38,6 +41,299 @@ fn build_tree(root: &Path) {
     let exe = root.join("tree/script.sh");
     std::fs::write(&exe, b"#!/bin/sh\necho hi\n").unwrap();
     std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// One receiver, one sender, both driven to completion. Returns what each end
+/// counted, which is the only way to see the manifest phase from outside.
+fn round_trip(paths: &[PathBuf], dest: &Path, token: [u8; TOKEN_LEN]) -> (Stats, Stats) {
+    let receiver = Receiver::bind(dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
+    let port = receiver.port().unwrap();
+    let handle = std::thread::spawn(move || {
+        let progress = Progress::new("receiving");
+        receiver.accept_one(&progress).unwrap()
+    });
+
+    let progress = Progress::new("sending");
+    let sent = send::send_to(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        paths,
+        &token,
+        &progress,
+    )
+    .unwrap();
+    (sent, handle.join().unwrap())
+}
+
+fn mtime_of(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// The skip check compares mtimes exactly, so the source ones are pinned
+/// rather than left at whatever second the test happened to run in.
+fn set_mtime(path: &Path, secs: i64) {
+    let dir = sys::open_dir(path.parent().unwrap()).unwrap();
+    let name = path.file_name().unwrap().to_str().unwrap();
+    sys::set_mtime_at(dir.as_fd(), name, secs).unwrap();
+}
+
+const PLAIN: [(&str, &str); 3] = [
+    ("a.txt", "alpha"),
+    ("sub/b.txt", "bravo two"),
+    ("sub/c.txt", "charlie"),
+];
+
+/// No symlinks anywhere, so a pass in which every file is skipped moves no
+/// bytes at all and the totals can be asserted exactly.
+fn build_plain_tree(root: &Path) -> u64 {
+    std::fs::create_dir_all(root.join("plain/sub")).unwrap();
+    for (i, (name, body)) in PLAIN.iter().enumerate() {
+        let path = root.join("plain").join(name);
+        std::fs::write(&path, body).unwrap();
+        set_mtime(&path, 1_600_000_000 + i as i64);
+    }
+    PLAIN.iter().map(|(_, body)| body.len() as u64).sum()
+}
+
+/// Every file already on the far side, byte for byte and second for second:
+/// the second pass must move nothing but the directory entries.
+#[test]
+fn a_repeat_transfer_skips_every_unchanged_file() {
+    let source = scratch("skip-all-source");
+    let dest = scratch("skip-all-dest");
+    let total = build_plain_tree(&source);
+    let token = [61u8; TOKEN_LEN];
+    let paths = [source.join("plain")];
+
+    let (first, _) = round_trip(&paths, &dest, token);
+    assert_eq!(first.skipped_files, 0, "a cold destination holds nothing");
+    assert_eq!(first.bytes, total);
+
+    let (sent, received) = round_trip(&paths, &dest, token);
+    assert_eq!(sent.skipped_files, PLAIN.len() as u64);
+    assert_eq!(sent.skipped_bytes, total);
+    assert_eq!(sent.bytes, 0, "a fully skipped pass moves no file data");
+    assert_eq!(sent.files, 2, "only the two directories are still sent");
+    assert_eq!(received.skipped_files, sent.skipped_files);
+    assert_eq!(received.skipped_bytes, sent.skipped_bytes);
+    assert_eq!(received.bytes, 0);
+
+    // Skipping must leave what is already there exactly as it was, or the next
+    // pass would skip a file that is wrong.
+    for (name, body) in PLAIN {
+        let landed = dest.join("plain").join(name);
+        assert_eq!(std::fs::read_to_string(&landed).unwrap(), body, "{name}");
+        assert_eq!(
+            mtime_of(&landed),
+            mtime_of(&source.join("plain").join(name)),
+            "{name} lost its mtime"
+        );
+    }
+}
+
+/// The quick check is per file, not per tree: one changed file must travel and
+/// its neighbours must not.
+#[test]
+fn only_the_file_that_changed_is_sent_again() {
+    let source = scratch("skip-one-source");
+    let dest = scratch("skip-one-dest");
+    build_plain_tree(&source);
+    let token = [62u8; TOKEN_LEN];
+    let paths = [source.join("plain")];
+
+    round_trip(&paths, &dest, token);
+
+    let changed = source.join("plain/sub/b.txt");
+    std::fs::write(&changed, "bravo two three").unwrap();
+    set_mtime(&changed, 1_700_000_000);
+
+    let (sent, received) = round_trip(&paths, &dest, token);
+    assert_eq!(sent.skipped_files, 2, "the two untouched files must skip");
+    assert_eq!(sent.bytes, "bravo two three".len() as u64);
+    assert_eq!(received.bytes, sent.bytes);
+    assert_eq!(
+        std::fs::read_to_string(dest.join("plain/sub/b.txt")).unwrap(),
+        "bravo two three"
+    );
+    assert_eq!(mtime_of(&dest.join("plain/sub/b.txt")), 1_700_000_000);
+    assert_eq!(
+        std::fs::read_to_string(dest.join("plain/a.txt")).unwrap(),
+        "alpha"
+    );
+}
+
+/// The bar promises what is left to move, not what was offered: the totals are
+/// set only after the manifest phase has said which files stay put.
+#[test]
+fn the_senders_progress_totals_count_only_the_unskipped_files() {
+    let source = scratch("totals-source");
+    let dest = scratch("totals-dest");
+    let total = build_plain_tree(&source);
+    let token = [69u8; TOKEN_LEN];
+    let paths = [source.join("plain")];
+
+    round_trip(&paths, &dest, token);
+
+    let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
+    let port = receiver.port().unwrap();
+    let handle = std::thread::spawn(move || {
+        let progress = Progress::new("receiving");
+        receiver.accept_one(&progress).unwrap()
+    });
+    let progress = Progress::new("sending");
+    send::send_to(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        &paths,
+        &token,
+        &progress,
+    )
+    .unwrap();
+    handle.join().unwrap();
+
+    assert!(total > 0, "setup: the first pass must have moved something");
+    assert_eq!(
+        progress.totals(),
+        (2, 0),
+        "only the two directories are still on the sender's list"
+    );
+}
+
+/// The receiver's scratch name must not be a name the sender can also send:
+/// two inodes sharing one directory entry would lose one of them, silently and
+/// with every digest still matching.
+#[test]
+fn a_source_file_named_like_a_partial_survives_alongside_its_twin() {
+    let source = scratch("partial-name-source");
+    let dest = scratch("partial-name-dest");
+    let tree = source.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("x"), b"the real x").unwrap();
+    std::fs::write(tree.join(".x.tf-partial"), b"the real dotfile").unwrap();
+
+    round_trip(&[tree], &dest, [70u8; TOKEN_LEN]);
+
+    assert_eq!(
+        std::fs::read_to_string(dest.join("tree/x")).unwrap(),
+        "the real x"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("tree/.x.tf-partial")).unwrap(),
+        "the real dotfile"
+    );
+}
+
+/// An interrupted transfer must not cost the destination the copy it already
+/// had: the receiver writes to a temp name and renames only once the file is
+/// complete and verified.
+#[test]
+fn an_interrupted_transfer_leaves_the_previous_copy_intact() {
+    let source = scratch("interrupt-source");
+    let dest = scratch("interrupt-dest");
+    let file = source.join("keepme.bin");
+    std::fs::write(&file, vec![7u8; 4 << 20]).unwrap();
+    let previous = b"the copy that was already here";
+    std::fs::write(dest.join("keepme.bin"), previous).unwrap();
+
+    let token = [63u8; TOKEN_LEN];
+    let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
+    let port = receiver.port().unwrap();
+
+    // The sender reads nothing off disk until the manifest has been answered,
+    // so while it waits for a receiver that has not accepted yet the file can
+    // be shrunk under it with no timing to tune. It then streams what is left,
+    // hits EOF early and aborts — mid-file, by construction.
+    let (tx, aborted) = mpsc::channel();
+    let sending = file.clone();
+    std::thread::spawn(move || {
+        let progress = Progress::new("sending");
+        let _ = tx.send(send::send_to(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            &[sending],
+            &token,
+            &progress,
+        ));
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_len(1 << 20)
+        .unwrap();
+
+    let handle = std::thread::spawn(move || {
+        let progress = Progress::new("receiving");
+        receiver.accept_one(&progress)
+    });
+
+    let err = aborted
+        .recv_timeout(Duration::from_secs(30))
+        .expect("send_to must return")
+        .expect_err("a shrinking file must not be padded into a success");
+    assert!(err.to_string().contains("shrank"), "unhelpful error: {err}");
+    let receiver_err = handle.join().unwrap().expect_err("receiver must not ack");
+    assert!(
+        receiver_err.to_string().contains("keepme.bin truncated"),
+        "the receiver must have been mid-file, not stopped earlier: {receiver_err}"
+    );
+
+    assert_eq!(
+        std::fs::read(dest.join("keepme.bin")).unwrap(),
+        previous,
+        "the previous copy must survive a failed transfer untouched"
+    );
+    let left: Vec<String> = std::fs::read_dir(&dest)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "keepme.bin")
+        .collect();
+    assert!(left.is_empty(), "partial files left behind: {left:?}");
+}
+
+/// A name too long to prefix and suffix falls back to writing in place. It
+/// still has to land, and still has to be skippable next time.
+#[test]
+fn names_at_the_length_limit_still_transfer() {
+    let source = scratch("longname-source");
+    let dest = scratch("longname-dest");
+    std::fs::create_dir_all(source.join("long")).unwrap();
+
+    // NAME_MAX is 255; ".{name}.tf-partial" costs another 12 characters, so
+    // the first of these can be written through a temp name and the second
+    // cannot.
+    let names = ["a".repeat(255 - 12), "b".repeat(255)];
+    for name in &names {
+        let path = source.join("long").join(name);
+        std::fs::write(&path, name.as_bytes()).unwrap();
+        set_mtime(&path, 1_650_000_000);
+    }
+
+    let token = [64u8; TOKEN_LEN];
+    let paths = [source.join("long")];
+    let (sent, _) = round_trip(&paths, &dest, token);
+    assert_eq!(sent.skipped_files, 0);
+    for name in &names {
+        let landed = dest.join("long").join(name);
+        assert_eq!(
+            std::fs::read(&landed).unwrap(),
+            name.as_bytes(),
+            "a {}-character name did not arrive",
+            name.len()
+        );
+        assert_eq!(mtime_of(&landed), 1_650_000_000);
+    }
+
+    let (again, _) = round_trip(&paths, &dest, token);
+    assert_eq!(
+        again.skipped_files,
+        names.len() as u64,
+        "the in-place fallback must stamp the mtime like any other write"
+    );
 }
 
 #[test]
