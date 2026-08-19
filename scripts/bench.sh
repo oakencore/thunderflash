@@ -16,7 +16,12 @@ MEDIUM_COUNT="${TF_MEDIUM_COUNT:-10000}"
 # Both ends share one machine here, but blake3's rayon pool defaults to
 # wanting the whole machine's cores each, and the two pools thrash. Cap each
 # at half. The two-Mac procedure needs no cap; each side has its own cores.
-export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$(( $(sysctl -n hw.ncpu) / 2 ))}"
+# Each side gets a BLAKE3 pool, and the two ends share one machine, so cap
+# each at a bit under half the cores: a fully-allocated pair starves the
+# pipeline threads (measured: 10k x 1 MiB went 4.76s -> 5.67s on 18 cores).
+_POOL_CAP=$(( $(sysctl -n hw.ncpu) / 2 - 1 ))
+[ "$_POOL_CAP" -lt 1 ] && _POOL_CAP=1
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$_POOL_CAP}"
 
 FIXTURES="$BENCH_DIR/fixtures"
 DEST="$BENCH_DIR/dest"

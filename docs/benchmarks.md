@@ -20,7 +20,7 @@ Environment:
 | `TF_SMALL_COUNT` | `10000` | Number of 4 KiB files |
 | `TF_MEDIUM_COUNT` | `10000` | Number of 1 MiB files |
 | `TF_QUEUE_DEPTH` | `4` | Chunk buffers in flight per side; clamped to 1..=64 |
-| `RAYON_NUM_THREADS` | half of `hw.ncpu` | BLAKE3 parallel-hash pool size per end. Both ends are capped because they share one machine; unset it for the two-Mac procedure |
+| `RAYON_NUM_THREADS` | `hw.ncpu/2 - 1` | BLAKE3 parallel-hash pool size per end. Both ends are capped because they share one machine, leaving 2 cores for the pipelines (a fully-allocated pair starves them); unset it for the two-Mac procedure |
 | `TF_STREAMS` | `1` | Parallel flows for the session (2..=16 enables v4). `bench.sh` runs it at 1; the two-Mac procedure A/Bs 1 vs 4 |
 
 The script builds `target/release/examples/bench`, generates fixtures once
