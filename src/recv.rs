@@ -1,11 +1,12 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver as ChanReceiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
@@ -69,6 +70,65 @@ impl Drop for InFlight {
     }
 }
 
+/// The directories whose contents changed during a durable session.
+///
+/// Flushing the destination root alone is not enough for a nested tree: a
+/// rename, mkdir or symlink only survives a power cut once the *directory
+/// that received the entry* is fsync'd — usually a subdirectory, often never
+/// the root. Every party that adds an entry records its parent here, and the
+/// session's final pass flushes all of them.
+///
+/// Deduplicated by `(device, inode)`: entries arrive depth-first, so one
+/// directory normally receives hundreds of entries but is flushed exactly
+/// once. The registered descriptor pins the inode, for the same reason the
+/// parent cache keeps its open directories.
+pub(crate) struct DirRegistry {
+    seen: HashSet<(u64, u64)>,
+    dirs: Vec<Arc<OwnedFd>>,
+}
+
+impl DirRegistry {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            dirs: Vec::new(),
+        }
+    }
+
+    /// Record `dir` as having received a new entry, and keep it open through
+    /// the final flush.
+    fn register(&mut self, dir: &Arc<OwnedFd>) -> io::Result<()> {
+        let id = sys::fd_identity(dir.as_fd())?;
+        if self.seen.insert(id) {
+            self.dirs.push(Arc::clone(dir));
+        }
+        Ok(())
+    }
+
+    /// Fsync every recorded directory.
+    fn flush_all(&self) -> io::Result<()> {
+        for dir in &self.dirs {
+            sys::full_fsync(dir.as_raw_fd())?;
+        }
+        Ok(())
+    }
+}
+
+/// Record that `parent` received a new entry, for the session's final
+/// durable flush. A non-durable session carries no registry and this is a
+/// no-op, which is also why a `None` costs nothing in the data path.
+fn register_parent(
+    regs: &Option<Arc<Mutex<DirRegistry>>>,
+    parent: &Arc<OwnedFd>,
+) -> io::Result<()> {
+    if let Some(regs) = regs {
+        regs.lock()
+            .expect("registry lock poisoned: a registrant panicked, which already unwinds to a join the caller checks")
+            .register(parent)?;
+    }
+    Ok(())
+}
+
 /// Drain the queue onto disk. Runs on one thread for the whole session.
 ///
 /// Ends the file's life in every direction: normal completion stamps mtime
@@ -78,11 +138,16 @@ impl Drop for InFlight {
 ///
 /// With `durable`, a file is not complete until it has also been flushed to
 /// permanent storage; a failed flush is as fatal as a failed write.
+///
+/// `regs` is the durability registry: after a successful rename the
+/// destination directory recorded it, so the session's final pass can flush
+/// it. Present only for durable sessions, where every entry must settle.
 fn write_loop(
     rx: ChanReceiver<Msg>,
     pool: SyncSender<Vec<u8>>,
     diag: Option<Arc<Diag>>,
     durable: bool,
+    regs: Option<Arc<Mutex<DirRegistry>>>,
 ) -> io::Result<()> {
     let mut current: Option<InFlight> = None;
     let diag = diag.as_deref();
@@ -140,13 +205,19 @@ fn write_loop(
                     // The last step, and the only one that makes the new
                     // contents visible under the real name: everything above
                     // can still fail with the previous file intact.
-                    if let Some(final_name) = open.final_name.take()
-                        && let Err(err) =
+                    if let Some(final_name) = open.final_name.take() {
+                        if let Err(err) =
                             sys::rename_at(open.parent.as_fd(), &open.name, &final_name)
-                    {
-                        drop(open);
-                        drop(rx);
-                        return Err(err);
+                        {
+                            drop(open);
+                            drop(rx);
+                            return Err(err);
+                        }
+                        // A new directory entry was made: credit the
+                        // directory that received it so the durable pass
+                        // flushes it. In-place writes have no rename, so no
+                        // parent to charge — the file's own flush covers it.
+                        register_parent(&regs, &open.parent)?;
                     }
                     open.finished = true;
                 }
@@ -238,8 +309,9 @@ impl Receiver {
         self
     }
 
-    /// Flush every file and the destination directory to permanent storage
-    /// before acknowledging the transfer. Costs throughput; see the README.
+    /// Flush every file and every directory that received an entry to
+    /// permanent storage before acknowledging the transfer. Costs throughput;
+    /// see the README.
     pub fn with_durable(mut self, durable: bool) -> Receiver {
         self.durable = durable;
         self
@@ -382,7 +454,13 @@ impl Receiver {
         }
         let writer_diag = self.diag.clone();
         let durable = self.durable;
-        let writer = std::thread::spawn(move || write_loop(rx, pool_tx, writer_diag, durable));
+        // A durable session must flush every directory that received an
+        // entry, so the net thread and the writer both record them here.
+        // Non-durable keeps it `None`: no registration, no final flush.
+        let regs = durable.then(|| Arc::new(Mutex::new(DirRegistry::new())));
+        let writer_regs = regs.clone();
+        let writer =
+            std::thread::spawn(move || write_loop(rx, pool_tx, writer_diag, durable, writer_regs));
         // net -> hash -> write: the buffers pass through, still bounded by the
         // same pool, so memory is unchanged and the three stages overlap.
         // A no-verify stream has nothing to hash, so the stage is skipped and
@@ -400,7 +478,8 @@ impl Receiver {
             (tx, None)
         };
 
-        let received = self.read_entries(stream, &entry_tx, &pool_rx, progress, verify);
+        let received =
+            self.read_entries(stream, &entry_tx, &pool_rx, progress, verify, regs.clone());
         drop(entry_tx);
         // Both joins happen before any `?`: returning early on a hash-thread
         // panic would leave the writer detached, still holding a file it is
@@ -416,14 +495,18 @@ impl Receiver {
         let stats = received?;
 
         // Every file is already flushed by here; the names themselves live in
-        // the directory, which needs its own flush to survive a power cut.
-        if self.durable {
+        // the directories that received them, and each of those needs its own
+        // flush to survive a power cut.
+        if let Some(regs) = &regs {
             let started = Instant::now();
-            let root = sys::open_dir(&self.dest)?;
-            sys::full_fsync(root.as_raw_fd())?;
+            let result = regs
+                .lock()
+                .expect("registry lock poisoned: a registrant panicked, which already unwinds to a join the caller checks")
+                .flush_all();
             if let Some(diag) = self.diag.as_deref() {
                 add_elapsed(&diag.flush_nanos, started);
             }
+            result?;
         }
 
         // Only now is every byte committed, so it is safe to let the sender
@@ -440,8 +523,13 @@ impl Receiver {
         pool: &ChanReceiver<Vec<u8>>,
         progress: &Progress,
         verify: bool,
+        regs: Option<Arc<Mutex<DirRegistry>>>,
     ) -> io::Result<Stats> {
-        let root = sys::open_dir(&self.dest)?;
+        let root = Arc::new(sys::open_dir(&self.dest)?);
+        // The destination root counts even when every entry under it skips:
+        // a durable session that changes nothing still owes the root a flush,
+        // as the old root-only fsync always gave it.
+        register_parent(&regs, &root)?;
         let mut stats = Stats::default();
         let diag = self.diag.as_deref();
         let sink = Sink { tx, pool, diag };
@@ -487,6 +575,8 @@ impl Receiver {
                     sys::mkdir_at(dir.as_fd(), name, entry.mode | 0o700)?;
                     // Files are stamped by the writer once their last byte lands.
                     let _ = sys::set_mtime_at(dir.as_fd(), name, entry.mtime);
+                    // `dir` received a new entry: flush it if the session is durable.
+                    register_parent(&regs, &dir)?;
                     if let Some(diag) = diag {
                         add_elapsed(&diag.meta_nanos, meta_started);
                         diag.dirs.fetch_add(1, Relaxed);
@@ -513,6 +603,11 @@ impl Receiver {
                     // Replace any existing entry so repeat transfers work.
                     let _ = sys::unlink_at(dir.as_fd(), name);
                     sys::symlink_at(&target, dir.as_fd(), name)?;
+                    // Stamped like file contents: the link's own mtime is part
+                    // of what "unchanged" means on the next manifest.
+                    let _ = sys::set_mtime_at(dir.as_fd(), name, entry.mtime);
+                    // The entry (or its replacement) landed in `dir`.
+                    register_parent(&regs, &dir)?;
                     // Counted so both ends agree on the byte total; the
                     // sender puts the target on the wire the same way.
                     stats.bytes += entry.size;
@@ -821,6 +916,29 @@ mod tests {
         crate::wire::encode_handshake(0, token)
     }
 
+    /// Two independent descriptors for the same directory dedup to one flush;
+    /// a different directory stays a second one.
+    #[test]
+    fn the_registry_dedups_by_inode_and_keeps_distinct_dirs() {
+        let dir = scratch("registry");
+        let other = scratch("registry-other");
+
+        let same_a = Arc::new(sys::open_dir(&dir).unwrap());
+        let same_b = Arc::new(sys::open_dir(&dir).unwrap());
+        let diff = Arc::new(sys::open_dir(&other).unwrap());
+
+        let mut reg = DirRegistry::new();
+        reg.register(&same_a).unwrap();
+        reg.register(&same_b).unwrap();
+        reg.register(&diff).unwrap();
+        assert_eq!(reg.dirs.len(), 2, "same-inode pair must collapse to one");
+
+        // A second round over the same descriptors adds nothing new.
+        reg.register(&same_a).unwrap();
+        reg.register(&diff).unwrap();
+        assert_eq!(reg.dirs.len(), 2, "re-registration must not grow the set");
+    }
+
     /// The name the bytes actually land under, which is what the cleanup
     /// assertions below are really about.
     fn temp_name(name: &str) -> String {
@@ -1007,7 +1125,7 @@ mod tests {
         (
             tx,
             pool_rx,
-            std::thread::spawn(move || write_loop(rx, pool_tx, None, durable)),
+            std::thread::spawn(move || write_loop(rx, pool_tx, None, durable, None)),
         )
     }
 

@@ -93,12 +93,20 @@ directory entries, and says how many files it skipped.
 Contents are not compared. A destination file edited to the same size and
 timestamp is left alone; delete it to force a fresh copy.
 
-Files are replaced atomically. The receiver writes to `.name.tf-partial`
-beside the target and renames over the real name only once the last byte has
-arrived and verified, so an interrupted transfer costs the temp file and never
-the copy that was already there. Names too long to carry the prefix and suffix
-(over 243 characters) are written in place instead, and those can still be
-lost to an interrupted run.
+Files are replaced atomically. The receiver writes to a
+`.name.a1b2c3d4.tf-partial` scratch file beside the target and renames it over
+the real name only once the last byte has arrived and verified, so an
+interrupted transfer costs the temp file and never the copy that was already
+there. Names too long to carry the prefix and suffix (over 243 characters) are
+written in place instead, and those can still be lost to an interrupted run.
+
+The scratch name is randomized for exactly this reason: a transfer that is
+killed without running its cleanup — SIGKILL, a power cut, a crash, or even
+SIGINT on a path that does not handle it — can leave a partial file behind,
+and every later run opens fresh scratch names, so an old partial is never
+silently adopted as someone else's in-progress file. It is inert but it is not
+deleted on the next run; find it with `find DEST -name '.*.tf-partial'` and
+remove the strays yourself.
 
 ## Content verification
 
@@ -137,17 +145,21 @@ it.
 
 `tf recv --durable` withholds the acknowledgement until each regular file has
 been flushed with `F_FULLFSYNC` (which asks the drive to empty its own write
-cache) and the destination root directory has been flushed too. A file is
+cache) and every directory that received an entry has been flushed too —
+usually many subdirectories, always including the destination root. A file is
 flushed after its mtime is stamped, so the timestamp is persisted with the
-contents. Where the filesystem does not support `F_FULLFSYNC`, `tf` falls back
-to `fsync` and prints one warning. Any other flush failure discards the
-partial file and fails the transfer, the same as a write error.
+contents; a directory is flushed after the final rename, mkdir or symlink that
+landed in it, so the name itself survives the same power cut. Where the
+filesystem does not support `F_FULLFSYNC`, `tf` falls back to `fsync` and
+prints one warning. Any other flush failure discards the partial file and
+fails the transfer, the same as a write error.
+
+Symlinks have no data of their own: their directory entry is durable once the
+directory that received it is flushed, like any other entry, and their mtime is
+stamped so the next manifest treats them as held.
 
 `--durable` is no defence against hardware, firmware or filesystem corruption,
-or a drive that lies about its cache. Symlinks are not flushed, and
-directories below the destination root are not individually flushed, so an
-intermediate directory entry can still be lost even though the file it named
-was flushed.
+or a drive that lies about its cache.
 
 The cost scales with file count, not bytes: 10,000 × 1 MiB files went from
 6.1 s to 40.4 s; one 16 GiB file was unchanged.
@@ -157,8 +169,8 @@ The cost scales with file count, not bytes: 10,000 × 1 MiB files went from
 ```
 tf recv [DIR]              Receive into DIR (default: current directory)
   --port <PORT>            Fixed TCP port (default: any free port)
-  --durable                Flush files and the destination directory to
-                           permanent storage before acknowledging
+  --durable                Flush every file and every directory that received
+                            an entry to permanent storage before acknowledging
   --stats                  Print transfer diagnostics to stderr when done
 
 tf send <PATHS>...         Send files or directories

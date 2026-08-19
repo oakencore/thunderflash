@@ -40,7 +40,8 @@ enum Command {
         /// Print transfer diagnostics to stderr when the run ends.
         #[arg(long)]
         stats: bool,
-        /// Flush every received file to permanent storage before acknowledging.
+        /// Flush every received file and every directory that received an
+        /// entry to permanent storage before acknowledging.
         #[arg(long)]
         durable: bool,
     },

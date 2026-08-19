@@ -182,6 +182,16 @@ pub fn stat_file_in_dir(dir: BorrowedFd, name: &str) -> io::Result<(u64, i64)> {
     Ok((st.st_size as u64, st.st_mtime as i64))
 }
 
+/// The `(device, inode)` pair a descriptor pins, so open descriptors naming
+/// the same directory can be told apart from one another.
+pub fn fd_identity(fd: BorrowedFd) -> io::Result<(u64, u64)> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == -1 {
+        return Err(last_error());
+    }
+    Ok((st.st_dev as u64, st.st_ino))
+}
+
 /// Create the scratch file a payload lands in before it is renamed into place,
 /// and report the name it got.
 ///
