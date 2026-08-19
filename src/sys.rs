@@ -140,27 +140,31 @@ pub fn walk_dirs(root: BorrowedFd, components: &[&str]) -> io::Result<OwnedFd> {
     Ok(current)
 }
 
-/// Size and mtime of a regular file under `root`, creating nothing.
+/// Open an existing directory chain, creating nothing.
 ///
-/// Same escape-prevention discipline as `walk_dirs` — every component opened
-/// O_NOFOLLOW, the leaf stat'd AT_SYMLINK_NOFOLLOW — minus the mkdir, because
-/// the manifest check must not leave a trace of a file it decides against.
-/// Anything that is not a plain file (missing, a symlink, a directory) is an
-/// error, since the only caller treats every failure the same way: we do not
-/// have this, so send it.
-pub fn stat_regular_file(root: BorrowedFd, components: &[&str]) -> io::Result<(u64, i64)> {
-    let (name, parents) = components
-        .split_last()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty path"))?;
+/// The manifest's "do we already hold this file?" check needs the parents'
+/// descriptors but must not leave a trace of a file it decides against, so
+/// this is `walk_dirs` minus the mkdir. Same escape-prevention discipline:
+/// every component opened O_NOFOLLOW.
+pub fn open_dir_chain(root: BorrowedFd, components: &[&str]) -> io::Result<OwnedFd> {
     let mut current = root.try_clone_to_owned()?;
-    for component in parents {
+    for component in components {
         current = open_dir_at(current.as_fd(), component)?;
     }
+    Ok(current)
+}
+
+/// Size and mtime of a regular file directly inside an open directory.
+///
+/// The leaf is stat'd AT_SYMLINK_NOFOLLOW, and anything that is not a plain
+/// file (missing, a symlink, a directory) is an error, since the caller
+/// treats every failure the same way: we do not have this, so send it.
+pub fn stat_file_in_dir(dir: BorrowedFd, name: &str) -> io::Result<(u64, i64)> {
     let name = cstr(name)?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let rc = unsafe {
         libc::fstatat(
-            current.as_raw_fd(),
+            dir.as_raw_fd(),
             name.as_ptr(),
             &mut st,
             libc::AT_SYMLINK_NOFOLLOW,
@@ -429,22 +433,30 @@ mod tests {
     }
 
     #[test]
-    fn stat_regular_file_reports_size_and_mtime() {
+    fn manifest_walk_and_leaf_stat_report_size_and_mtime() {
         let root = scratch("stat-regular");
-        std::fs::write(root.join("f.bin"), b"12345").unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/f.bin"), b"12345").unwrap();
         let root_fd = open_dir(&root).unwrap();
-        set_mtime_at(root_fd.as_fd(), "f.bin", 1_600_000_000).unwrap();
+        set_mtime_at(
+            open_dir(&root.join("a/b")).unwrap().as_fd(),
+            "f.bin",
+            1_600_000_000,
+        )
+        .unwrap();
 
+        let parent = open_dir_chain(root_fd.as_fd(), &["a", "b"]).unwrap();
         assert_eq!(
-            stat_regular_file(root_fd.as_fd(), &["f.bin"]).unwrap(),
+            stat_file_in_dir(parent.as_fd(), "f.bin").unwrap(),
             (5, 1_600_000_000)
         );
     }
 
     /// The manifest check must never be talked into stat'ing the far end of a
-    /// symlink, at the leaf or at any component along the way.
+    /// symlink, at the leaf or at any component along the way, and a missing
+    /// parent stops the walk rather than answering from somewhere else.
     #[test]
-    fn stat_regular_file_refuses_symlinks_and_missing_paths() {
+    fn manifest_walk_refuses_symlinks_and_missing_paths() {
         let root = scratch("stat-symlink");
         let outside = scratch("stat-symlink-outside");
         std::fs::write(outside.join("victim.txt"), b"secret").unwrap();
@@ -452,9 +464,10 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
 
         let root_fd = open_dir(&root).unwrap();
-        assert!(stat_regular_file(root_fd.as_fd(), &["leaf"]).is_err());
-        assert!(stat_regular_file(root_fd.as_fd(), &["escape", "victim.txt"]).is_err());
-        assert!(stat_regular_file(root_fd.as_fd(), &["absent"]).is_err());
+        assert!(open_dir_chain(root_fd.as_fd(), &["escape"]).is_err());
+        assert!(open_dir_chain(root_fd.as_fd(), &["absent", "x"]).is_err());
+        assert!(stat_file_in_dir(root_fd.as_fd(), "leaf").is_err());
+        assert!(stat_file_in_dir(root_fd.as_fd(), "absent").is_err());
     }
 
     #[test]

@@ -35,6 +35,10 @@ pub const DIGEST_LEN: usize = 32;
 /// which parallelises chunk compression across cores; below it the join
 /// overhead loses to the work, so it stays on plain `update`.
 pub const RAYON_MIN: usize = 256 * 1024;
+/// `F_NOCACHE` above this file size, both ends. The fcntl is one syscall per
+/// file; measured at ~13% of a 10k x 4 KiB run, where it protects almost
+/// nothing. For files at or above this it is amortised away.
+pub const NOCACHE_MIN: u64 = 1024 * 1024;
 pub type Digest = [u8; DIGEST_LEN];
 
 /// A peer that has said nothing for this long is gone, not slow: both ends

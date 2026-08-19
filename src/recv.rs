@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -12,8 +12,8 @@ use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
     ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, HANDSHAKE_LEN, HANDSHAKE_TIMEOUT,
-    IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN, ct_eq, decode_handshake, encode_bitmap, hash_update,
-    queue_depth, sanitize, set_timeouts,
+    IDLE_TIMEOUT, Kind, NOCACHE_MIN, Stats, TOKEN_LEN, ct_eq, decode_handshake, encode_bitmap,
+    hash_update, queue_depth, sanitize, set_timeouts,
 };
 
 /// Work handed to the writer thread. `Begin` carries the descriptors the
@@ -116,7 +116,11 @@ fn write_loop(
                 if let Some(mut open) = current.take() {
                     // The mode is applied only now: creating with it would
                     // make a read-only file unwritable to our own writer.
-                    let _ = sys::set_mode_fd(open.file.as_raw_fd(), open.mode);
+                    // Creation already set mode|0o600, so files whose owner
+                    // bits are fully set need no fchmod at all.
+                    if open.mode & 0o600 != 0o600 {
+                        let _ = sys::set_mode_fd(open.file.as_raw_fd(), open.mode);
+                    }
                     let _ = sys::set_mtime_fd(open.file.as_raw_fd(), open.mtime);
                     if durable {
                         // After the stamp, so the mtime is what gets persisted.
@@ -254,14 +258,18 @@ impl Receiver {
             add_elapsed(&diag.accept_nanos, waiting);
         }
         sys::set_socket_buffers(stream.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
+        // The bitmap reply and the final ACK are tiny writes; without this
+        // they can wait out Nagle's timer before they set out.
+        stream.set_nodelay(true)?;
         // A peer that connects and then says nothing must not pin the only
         // session this process will ever accept. Both loops treat any read or
         // write error as fatal-and-clean-up, so a timeout needs no new path.
         set_timeouts(&stream, HANDSHAKE_TIMEOUT)?;
         let verify = self.verify_handshake(&mut stream, peer)?;
         set_timeouts(&stream, IDLE_TIMEOUT)?;
-        let (skipped_files, skipped_bytes) = self.answer_manifest(&mut stream)?;
-        let mut stats = self.receive_entries(&mut stream, progress, verify)?;
+        let mut staged = Staged::new(stream);
+        let (skipped_files, skipped_bytes) = self.answer_manifest(&mut staged)?;
+        let mut stats = self.receive_entries(&mut staged, progress, verify)?;
         stats.skipped_files = skipped_files;
         stats.skipped_bytes = skipped_bytes;
         Ok(stats)
@@ -275,10 +283,13 @@ impl Receiver {
     /// file we cannot stat, for any reason at all, is simply one we do not
     /// have, and the transfer carries on as if v2. Returns what the answer
     /// saved, so the summary can say so.
-    fn answer_manifest(&self, stream: &mut TcpStream) -> io::Result<(u64, u64)> {
+    fn answer_manifest(&self, stream: &mut Staged) -> io::Result<(u64, u64)> {
         let root = sys::open_dir(&self.dest)?;
         let mut bits = Vec::new();
         let (mut files, mut bytes) = (0u64, 0u64);
+        // Entries arrive depth-first, so consecutive files share their
+        // parent: keep it open instead of re-walking the chain per entry.
+        let mut parents = ParentCache::default();
 
         while let Some(entry) = Entry::decode(stream)? {
             // Dirs are EEXIST-tolerant and symlink payloads are tens of bytes,
@@ -286,7 +297,7 @@ impl Receiver {
             if entry.kind != Kind::File {
                 continue;
             }
-            let have = already_have(root.as_fd(), &entry);
+            let have = self.file_held(&root, &mut parents, &entry);
             if have {
                 files += 1;
                 bytes += entry.size;
@@ -294,9 +305,42 @@ impl Receiver {
             bits.push(have);
         }
 
-        stream.write_all(&encode_bitmap(&bits))?;
-        stream.flush()?;
+        stream.stream().write_all(&encode_bitmap(&bits))?;
+        stream.stream().flush()?;
         Ok((files, bytes))
+    }
+
+    /// Does the destination already hold this exact file?
+    ///
+    /// Deliberately total: every way of not knowing — a path we refuse, a
+    /// missing component, a symlink where a file should be, a directory we
+    /// cannot open — answers "no". The check only ever decides whether bytes
+    /// travel, so being wrong costs a retransfer, while failing here would
+    /// cost the transfer.
+    ///
+    /// Size and mtime are enough because the receiver stamps the sender's
+    /// mtime on completion: a file that matches both was put there by this
+    /// tool, from this source, and a file still being written has neither.
+    fn file_held(&self, root: &OwnedFd, parents: &mut ParentCache, entry: &Entry) -> bool {
+        let Ok(components) = sanitize(&entry.path) else {
+            return false;
+        };
+        let (name, parent_names) = match components.split_last() {
+            Some((name, parent_names)) => (name, parent_names),
+            None => return false,
+        };
+        // Open-only walk: the check must not leave a trace of a file it
+        // decides against, so no mkdir is involved.
+        let dir = match parents.get(parent_names, || {
+            Ok(Arc::new(sys::open_dir_chain(root.as_fd(), parent_names)?))
+        }) {
+            Ok(dir) => dir,
+            Err(_) => return false,
+        };
+        matches!(
+            sys::stat_file_in_dir(dir.as_fd(), name),
+            Ok((size, mtime)) if size == entry.size && mtime == entry.mtime
+        )
     }
 
     /// Returns whether the sender's stream carries digests to check.
@@ -324,7 +368,7 @@ impl Receiver {
 
     fn receive_entries(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut Staged,
         progress: &Progress,
         verify: bool,
     ) -> io::Result<Stats> {
@@ -384,14 +428,14 @@ impl Receiver {
 
         // Only now is every byte committed, so it is safe to let the sender
         // claim success.
-        stream.write_all(&[ACK])?;
-        stream.flush()?;
+        stream.stream().write_all(&[ACK])?;
+        stream.stream().flush()?;
         Ok(stats)
     }
 
     fn read_entries(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut Staged,
         tx: &SyncSender<Msg>,
         pool: &ChanReceiver<Vec<u8>>,
         progress: &Progress,
@@ -422,7 +466,9 @@ impl Receiver {
 
             // walk_dirs opens each component with O_NOFOLLOW, so a symlinked
             // parent aborts here rather than redirecting the write.
-            let dir = parent_cache.get(root.as_fd(), parents)?;
+            let dir = parent_cache.get(parents, || {
+                Ok(Arc::new(sys::walk_dirs(root.as_fd(), parents)?))
+            })?;
             if let Some(diag) = diag {
                 add_elapsed(&diag.meta_nanos, meta_started);
             }
@@ -493,26 +539,6 @@ impl Receiver {
     }
 }
 
-/// Does the destination already hold this exact file?
-///
-/// Deliberately total: every way of not knowing — a path we refuse, a missing
-/// component, a symlink where a file should be, a directory we cannot open —
-/// answers "no". The check only ever decides whether bytes travel, so being
-/// wrong costs a retransfer, while failing here would cost the transfer.
-///
-/// Size and mtime are enough because the receiver stamps the sender's mtime on
-/// completion: a file that matches both was put there by this tool, from this
-/// source, and a file still being written has neither.
-fn already_have(root: BorrowedFd, entry: &Entry) -> bool {
-    let Ok(components) = sanitize(&entry.path) else {
-        return false;
-    };
-    matches!(
-        sys::stat_regular_file(root, &components),
-        Ok((size, mtime)) if size == entry.size && mtime == entry.mtime
-    )
-}
-
 /// The directory the previous entry lived in, kept open.
 ///
 /// Entries arrive depth-first sorted, so consecutive entries nearly always
@@ -542,14 +568,20 @@ struct ParentCache {
 }
 
 impl ParentCache {
-    fn get(&mut self, root: BorrowedFd, parents: &[&str]) -> io::Result<Arc<OwnedFd>> {
+    /// The parent's descriptor, reusing the cache on an identical component
+    /// list and calling `open` — fresh O_NOFOLLOW walk, mkdir allowed or not
+    /// is the caller's choice — when the last entry lived elsewhere.
+    fn get<F>(&mut self, parents: &[&str], open: F) -> io::Result<Arc<OwnedFd>>
+    where
+        F: FnOnce() -> io::Result<Arc<OwnedFd>>,
+    {
         if let Some(dir) = &self.dir
             && self.components.len() == parents.len()
             && self.components.iter().zip(parents).all(|(a, b)| a == b)
         {
             return Ok(Arc::clone(dir));
         }
-        let dir = Arc::new(sys::walk_dirs(root, parents)?);
+        let dir = open()?;
         self.components.clear();
         self.components
             .extend(parents.iter().map(|p| p.to_string()));
@@ -566,6 +598,61 @@ struct Sink<'a> {
     diag: Option<&'a Diag>,
 }
 
+/// Upper bound on staged bytes. Small enough to be one socket read's worth,
+/// big enough that a small file's whole header, payload and digest decode
+/// from memory.
+const STAGE_CAP: usize = 64 * 1024;
+
+/// A socket behind a small staging buffer. Entry headers are eight fields
+/// (kind, length, path, size, mode, mtime) that each used to cost a read
+/// syscall; digests and small payloads did too. With staging, one socket
+/// read covers many entries and they decode from memory.
+///
+/// Large reads — the pooled CHUNK buffers — bypass the stage: a double copy
+/// at 4 MiB would cost more than the syscalls it saves, so they go straight
+/// to the socket whenever the stage is drained.
+struct Staged {
+    stream: TcpStream,
+    stage: Vec<u8>,
+    off: usize,
+    end: usize,
+}
+
+impl Staged {
+    fn new(stream: TcpStream) -> Staged {
+        Staged {
+            stream,
+            stage: vec![0u8; STAGE_CAP],
+            off: 0,
+            end: 0,
+        }
+    }
+
+    /// For the writes this struct does not buffer: the manifest bitmap and
+    /// the final acknowledgement.
+    fn stream(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+}
+
+impl Read for Staged {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.off == self.end {
+            if buf.len() >= STAGE_CAP {
+                // Drained and big: socket straight into the caller's buffer.
+                return self.stream.read(buf);
+            }
+            let end = self.stream.read(&mut self.stage)?;
+            self.off = 0;
+            self.end = end;
+        }
+        let n = buf.len().min(self.end - self.off);
+        buf[..n].copy_from_slice(&self.stage[self.off..self.off + n]);
+        self.off += n;
+        Ok(n)
+    }
+}
+
 /// Placeholder: the writer's own error replaces this on join.
 fn writer_gone() -> io::Error {
     io::Error::other("receiver writer thread stopped")
@@ -579,7 +666,7 @@ fn writer_gone() -> io::Error {
 /// unlinks whatever file is still in flight when the channel closes, so
 /// exactly one party removes a file that failed verification.
 fn check_digest(
-    stream: &mut TcpStream,
+    stream: &mut Staged,
     actual: Digest,
     path: &str,
     diag: Option<&Diag>,
@@ -603,7 +690,7 @@ fn check_digest(
 /// Read one file's payload off the socket into pooled buffers and hand them to
 /// the writer. Never touches the file's contents itself.
 fn pump_file(
-    stream: &mut TcpStream,
+    stream: &mut Staged,
     dir: &Arc<OwnedFd>,
     name: &str,
     entry: &Entry,
@@ -632,8 +719,11 @@ fn pump_file(
         ),
         Err(err) => return Err(err),
     };
-    // Advisory only, and non-fatal on the sender too.
-    let _ = sys::set_nocache(file.as_raw_fd());
+    // Advisory only, and non-fatal on the sender too. Sized the same way:
+    // per-file fcntl for a 4 KiB file costs more than the cache it protects.
+    if entry.size >= NOCACHE_MIN {
+        let _ = sys::set_nocache(file.as_raw_fd());
+    }
     if let Some(diag) = sink.diag {
         add_elapsed(&diag.meta_nanos, meta_started);
     }
@@ -718,7 +808,7 @@ mod tests {
     use super::*;
     use crate::wire::{Entry, Kind};
     use std::io::Write;
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream};
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tf-recv-{}-{}", name, std::process::id()));
@@ -764,6 +854,45 @@ mod tests {
         let mut bitmap = vec![0u8; files.div_ceil(8)];
         stream.read_exact(&mut bitmap).unwrap();
         bitmap
+    }
+
+    /// Small reads must keep coming from the stage and large ones skip
+    /// straight to the socket, but the assembled bytes may never diverge
+    /// from the stream in either order or content.
+    #[test]
+    fn staged_reads_preserve_stream_order_across_buffer_sizes() {
+        let expected: Vec<u8> = (0..STAGE_CAP as u32 * 2 + 5)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let total = expected.len();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let send = expected.clone();
+        let filler = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&send).unwrap();
+        });
+
+        let mut staged = Staged::new(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap());
+        let sizes = [1usize, 3, STAGE_CAP - 1, STAGE_CAP, CHUNK, 7];
+        let mut got = Vec::new();
+        let mut i = 0;
+        loop {
+            let remaining = total - got.len();
+            let want = sizes[i % sizes.len()].min(remaining).max(1);
+            i += 1;
+            let mut buf = vec![0u8; want];
+            match staged.read_exact(&mut buf) {
+                Ok(()) => got.extend(buf),
+                // One read past the end is the stop signal, not a failure.
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && got.len() == total => {
+                    break;
+                }
+                Err(err) => panic!("staged read failed: {err}"),
+            }
+        }
+        filler.join().unwrap();
+        assert_eq!(got, expected);
     }
 
     #[test]

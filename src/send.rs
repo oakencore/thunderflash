@@ -11,13 +11,36 @@ use std::time::{Instant, UNIX_EPOCH};
 use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
-    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN,
-    encode_handshake, hash_update, queue_depth, read_bitmap, set_timeouts, write_terminator,
+    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, IDLE_TIMEOUT, Kind, NOCACHE_MIN, Stats,
+    TOKEN_LEN, encode_handshake, hash_update, queue_depth, read_bitmap, set_timeouts,
+    write_terminator,
 };
 
 pub struct Item {
     pub abs: PathBuf,
     pub entry: Entry,
+    /// The header as it travels on the wire, encoded once at the walk so the
+    /// manifest and the data phase cannot drift apart and neither encodes
+    /// twice.
+    pub header: Vec<u8>,
+}
+
+fn make_item(abs: &Path, rel: String, kind: Kind, size: u64, mode: u32, mtime: i64) -> Item {
+    let entry = Entry {
+        kind,
+        path: rel,
+        size,
+        mode,
+        mtime,
+    };
+    // Kind + length + size + mode + mtime, then the path.
+    let mut header = Vec::with_capacity(23 + entry.path.len());
+    entry.encode(&mut header);
+    Item {
+        abs: abs.to_path_buf(),
+        entry,
+        header,
+    }
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> i64 {
@@ -61,30 +84,19 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
                 format!("symlink target of {abs:?} is not UTF-8"),
             )
         })?;
-        items.push(Item {
-            abs: abs.to_path_buf(),
-            entry: Entry {
-                kind: Kind::Symlink,
-                path: rel,
-                size: target.len() as u64,
-                mode,
-                mtime,
-            },
-        });
+        items.push(make_item(
+            abs,
+            rel,
+            Kind::Symlink,
+            target.len() as u64,
+            mode,
+            mtime,
+        ));
         return Ok(());
     }
 
     if meta.is_dir() {
-        items.push(Item {
-            abs: abs.to_path_buf(),
-            entry: Entry {
-                kind: Kind::Dir,
-                path: rel.clone(),
-                size: 0,
-                mode,
-                mtime,
-            },
-        });
+        items.push(make_item(abs, rel.clone(), Kind::Dir, 0, mode, mtime));
         let mut children: Vec<_> = std::fs::read_dir(abs)?.collect::<Result<_, _>>()?;
         children.sort_by_key(|c| c.file_name());
         for child in children {
@@ -108,16 +120,7 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
         return Ok(());
     }
 
-    items.push(Item {
-        abs: abs.to_path_buf(),
-        entry: Entry {
-            kind: Kind::File,
-            path: rel,
-            size: meta.len(),
-            mode,
-            mtime,
-        },
-    });
+    items.push(make_item(abs, rel, Kind::File, meta.len(), mode, mtime));
     Ok(())
 }
 
@@ -222,7 +225,7 @@ pub fn send_to_diag(
     // symlink target is smaller than the bit that would describe it.
     let mut manifest = Vec::new();
     for item in &items {
-        item.entry.encode(&mut manifest);
+        manifest.extend_from_slice(&item.header);
     }
     write_terminator(&mut manifest)?;
     stream.write_all(&manifest)?;
@@ -382,15 +385,15 @@ fn read_items(
 ) {
     let diag = diag.as_deref();
     for item in items {
-        progress.set_current(&item.entry.path);
+        let Item { abs, entry, header } = item;
+        progress.set_current(&entry.path);
 
-        let mut header = Vec::with_capacity(64 + item.entry.path.len());
-        item.entry.encode(&mut header);
+        // The header left the walk already encoded.
         if tx.send(Ok(Msg::Header(header))).is_err() {
             return;
         }
         if let Some(diag) = diag {
-            match item.entry.kind {
+            match entry.kind {
                 Kind::Dir => &diag.dirs,
                 Kind::Symlink => &diag.symlinks,
                 Kind::File | Kind::End => &diag.files,
@@ -398,23 +401,23 @@ fn read_items(
             .fetch_add(1, Relaxed);
         }
 
-        let result = match item.entry.kind {
+        let result = match entry.kind {
             // Directories are header-only.
             Kind::Dir | Kind::End => Ok(()),
-            Kind::Symlink => match std::fs::read_link(&item.abs) {
+            Kind::Symlink => match std::fs::read_link(&abs) {
                 Ok(target) => {
                     let bytes = target.to_string_lossy().into_owned().into_bytes();
                     // The header announcing this length is already on the
                     // wire. A link repointed since the walk would leave the
                     // receiver framing the next entry from the wrong offset,
                     // so abort here the way a shrinking file does.
-                    if bytes.len() as u64 != item.entry.size {
+                    if bytes.len() as u64 != entry.size {
                         let _ = tx.send(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
                                 "{} changed during transfer: announced {} bytes, target is now {}",
-                                item.entry.path,
-                                item.entry.size,
+                                entry.path,
+                                entry.size,
                                 bytes.len()
                             ),
                         )));
@@ -443,7 +446,7 @@ fn read_items(
                 }
                 Err(err) => Err(err),
             },
-            Kind::File => stream_file(&item, &tx, &pool, diag, verify),
+            Kind::File => stream_file(&abs, &entry, &tx, &pool, diag, verify),
         };
 
         if let Err(err) = result {
@@ -455,18 +458,23 @@ fn read_items(
 }
 
 fn stream_file(
-    item: &Item,
+    abs: &Path,
+    entry: &Entry,
     tx: &SyncSender<io::Result<Msg>>,
     pool: &Pool<Vec<u8>>,
     diag: Option<&Diag>,
     verify: bool,
 ) -> io::Result<()> {
-    let mut file = std::fs::File::open(&item.abs)?;
+    let mut file = std::fs::File::open(abs)?;
     // Keep a huge transfer from evicting the machine's entire page cache.
-    let _ = sys::set_nocache(file.as_raw_fd());
+    // Below NOCACHE_MIN the fcntl would cost more, per file, than the cache
+    // it protects.
+    if entry.size >= NOCACHE_MIN {
+        let _ = sys::set_nocache(file.as_raw_fd());
+    }
 
     let mut sent = 0u64;
-    while sent < item.entry.size {
+    while sent < entry.size {
         // Blocking here is the real backpressure: no free buffer means the
         // link has not drained what we already read.
         let Some(mut buf) = pooled_recv(pool, diag) else {
@@ -475,7 +483,7 @@ fn stream_file(
         };
         // Never read past the size we announced, so a file that grew mid
         // transfer still matches its header.
-        let want = (item.entry.size - sent).min(CHUNK as u64) as usize;
+        let want = (entry.size - sent).min(CHUNK as u64) as usize;
         let mut filled = 0;
         while filled < want {
             match file.read(&mut buf[filled..want]) {
@@ -492,8 +500,8 @@ fn stream_file(
                 io::ErrorKind::InvalidData,
                 format!(
                     "{} shrank during transfer: expected {} bytes, read {}",
-                    item.entry.path,
-                    item.entry.size,
+                    entry.path,
+                    entry.size,
                     sent + filled as u64
                 ),
             ));
@@ -589,13 +597,14 @@ mod tests {
                 mode: 0o644,
                 mtime: 0,
             },
+            header: Vec::new(),
         };
         let (tx, rx) = sync_channel::<io::Result<Msg>>(64);
         let (pool_tx, pool_rx) = sync_channel::<Vec<u8>>(64);
         for _ in 0..8 {
             pool_tx.send(vec![0u8; CHUNK]).unwrap();
         }
-        let result = stream_file(&item, &tx, &pool_rx, None, true);
+        let result = stream_file(&item.abs, &item.entry, &tx, &pool_rx, None, true);
         drop(tx);
         // Recycle so the pool never starves this single-threaded drive.
         let mut got = Vec::new();
@@ -656,20 +665,25 @@ mod tests {
     }
 
     fn item(kind: Kind, path: &str, size: u64) -> Item {
-        Item {
-            abs: PathBuf::from(path),
-            entry: Entry {
-                kind,
-                path: path.to_string(),
-                size,
-                mode: 0o644,
-                mtime: 0,
-            },
-        }
+        make_item(Path::new(path), path.to_string(), kind, size, 0o644, 0)
     }
 
     fn kept_paths(items: &[Item]) -> Vec<&str> {
         items.iter().map(|i| i.entry.path.as_str()).collect()
+    }
+
+    #[test]
+    fn the_walk_encoded_header_matches_the_entry_on_the_wire() {
+        for (kind, path, size) in [
+            (Kind::File, "a/b.bin", 12u64),
+            (Kind::Dir, "a", 0),
+            (Kind::Symlink, "l", 4096),
+        ] {
+            let got = make_item(Path::new(path), path.to_string(), kind, size, 0o644, 0);
+            let mut want = Vec::new();
+            got.entry.encode(&mut want);
+            assert_eq!(got.header, want, "mismatch for {path:?}");
+        }
     }
 
     #[test]
