@@ -20,6 +20,7 @@ Environment:
 | `TF_SMALL_COUNT` | `10000` | Number of 4 KiB files |
 | `TF_MEDIUM_COUNT` | `10000` | Number of 1 MiB files |
 | `TF_QUEUE_DEPTH` | `4` | Chunk buffers in flight per side; clamped to 1..=64 |
+| `RAYON_NUM_THREADS` | half of `hw.ncpu` | BLAKE3 parallel-hash pool size per end. Both ends are capped because they share one machine; unset it for the two-Mac procedure |
 
 The script builds `target/release/examples/bench`, generates fixtures once
 (reused on later runs), then for each workload starts a receiver, reads the
@@ -106,7 +107,10 @@ the M5 Max. Single runs; `--stats` on both ends.
 
 Verified throughput sits on the single-core BLAKE3 ceiling (~2.4 GB/s — the
 sender spent 12.19 s of the 13.0 s hashing, with 6,987 pool stalls showing
-backpressure holding the reader). `--no-verify` runs at the disk/link limit
+backpressure holding the reader). Note: those numbers predate the switch to
+BLAKE3's parallel path (`Hasher::update_rayon` for buffers of 256 KiB and
+up); the hash stage now spreads across cores, and a re-measured pair table
+is owed. `--no-verify` runs at the disk/link limit
 with essentially zero sender user CPU and zero pool stalls. Jumbo frames
 changed nothing measurable on this pair: the ~3.7 GB/s ceiling is not
 per-packet overhead. Peak sender RSS was 28 MB in every run.

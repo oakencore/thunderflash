@@ -44,8 +44,15 @@ battery still sleeps the machine, so keep the lids open.
 mixed pair, so the link negotiated Thunderbolt 4 at 40 Gb/s — sending 29.7 GB
 of real media files:
 
-- default (BLAKE3-verified): **2.3 GB/s**, limited by one hashing core per side
+- default (BLAKE3-verified): **2.3 GB/s**, limited by hashing (pre-parallel figure; see next note)
 - `--no-verify`: **3.7 GB/s**, limited by disk and link; sender CPU near zero
+
+Verification hashes are now computed on BLAKE3's parallel path (spreading
+across cores for buffers of 256 KiB and up) rather than on one core, so
+verified transfers should now sit closer to the `--no-verify` number; this
+pair has not been re-measured with that change yet. On one machine running
+both ends of a benchmark, the two hash pools contend; `bench.sh` caps each
+at half the cores for that reason.
 
 Even a Thunderbolt 4 link outruns the hasher; a TB5-to-TB5 pair (80 Gb/s) is
 unmeasured and can only widen the gap.
@@ -102,16 +109,18 @@ Neither side reads the data twice. A mismatch discards the partial file, fails
 with the offending path and withholds the acknowledgement, so the sender
 reports failure too.
 
-Verification is on by default and caps throughput at one BLAKE3 core (about
-2.5 GB/s). `tf send --no-verify` turns it off for that run — no hashing on
-either end, no digests on the wire; the receiver prints
+Verification is on by default; its hash runs on BLAKE3's parallel path, so it
+costs a few cores rather than the whole budget a single hasher used to take.
+On the 40 Gb/s pair above, a pre-parallel build lost 39% to it; a verified
+transfer on the current build should sit close to the `--no-verify` number.
+`tf send --no-verify` turns it off for that run — no hashing on either end,
+no digests on the wire; the receiver prints
 `content verification disabled by sender`. There is no receiver-side flag.
 
 The trade-off is real: TCP's 16-bit checksum is weak, so a `--no-verify`
 transfer can deliver silently corrupted bytes and still report success. Leave
-it on unless the link is genuinely faster than the hasher — on the 40 Gb/s
-link above it bought 39%; on slower links, or against a slow destination
-disk, it buys nothing.
+it on unless the link is genuinely faster than the hashing cores, or the
+destination disk is the limit and you want every byte of it.
 
 Both Macs must run the same protocol version (currently v3, which added the
 manifest exchange). Only the receiver parses a handshake, so only the

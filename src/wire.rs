@@ -31,6 +31,10 @@ pub const ACK: u8 = 0xFF;
 pub const CHUNK: usize = 4 * 1024 * 1024;
 /// Length of the BLAKE3 digest that follows every File and Symlink payload.
 pub const DIGEST_LEN: usize = 32;
+/// Buffers at or above this size are hashed with `Hasher::update_rayon`,
+/// which parallelises chunk compression across cores; below it the join
+/// overhead loses to the work, so it stays on plain `update`.
+pub const RAYON_MIN: usize = 256 * 1024;
 pub type Digest = [u8; DIGEST_LEN];
 
 /// A peer that has said nothing for this long is gone, not slow: both ends
@@ -70,6 +74,17 @@ pub fn queue_depth() -> usize {
 /// as bytes pass through; this is for short payloads and for tests.
 pub fn digest(bytes: &[u8]) -> Digest {
     *blake3::hash(bytes).as_bytes()
+}
+
+/// Incremental hash of one pooled buffer, on whichever BLAKE3 path suits its
+/// size: `update_rayon` pays a join overhead that small buffers do not earn
+/// back, so they stay on the plain path.
+pub fn hash_update(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    if bytes.len() >= RAYON_MIN {
+        hasher.update_rayon(bytes);
+    } else {
+        hasher.update(bytes);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

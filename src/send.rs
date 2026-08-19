@@ -12,7 +12,7 @@ use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
     ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN,
-    encode_handshake, queue_depth, read_bitmap, set_timeouts, write_terminator,
+    encode_handshake, hash_update, queue_depth, read_bitmap, set_timeouts, write_terminator,
 };
 
 pub struct Item {
@@ -141,8 +141,10 @@ enum Msg {
 
 /// Middle stage: hashes each chunk between the reader and the socket writer,
 /// so disk reads, hashing and socket writes overlap instead of taking turns.
-/// BLAKE3 is sequential over one file, so this thread is the sender's hashing
-/// budget. Buffers pass straight through; the pool still bounds memory.
+/// The hash state itself stays on this one thread (order is order), but the
+/// compression work inside `hash_update` spreads across cores for buffers at
+/// or above `RAYON_MIN`. Buffers pass straight through; the pool still bounds
+/// memory.
 fn hash_items(rx: Pool<io::Result<Msg>>, tx: SyncSender<io::Result<Msg>>, diag: Option<Arc<Diag>>) {
     let diag = diag.as_deref();
     let mut hasher = blake3::Hasher::new();
@@ -151,7 +153,7 @@ fn hash_items(rx: Pool<io::Result<Msg>>, tx: SyncSender<io::Result<Msg>>, diag: 
         let forward = match message {
             Ok(Msg::Chunk { buf, len }) => {
                 let started = Instant::now();
-                hasher.update(&buf[..len]);
+                hash_update(&mut hasher, &buf[..len]);
                 if let Some(diag) = diag {
                     add_elapsed(&diag.hash_nanos, started);
                 }

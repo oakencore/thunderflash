@@ -13,6 +13,11 @@ LARGE_GIB="${TF_LARGE_GIB:-16}"
 SMALL_COUNT="${TF_SMALL_COUNT:-10000}"
 MEDIUM_COUNT="${TF_MEDIUM_COUNT:-10000}"
 
+# Both ends share one machine here, but blake3's rayon pool defaults to
+# wanting the whole machine's cores each, and the two pools thrash. Cap each
+# at half. The two-Mac procedure needs no cap; each side has its own cores.
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$(( $(sysctl -n hw.ncpu) / 2 ))}"
+
 FIXTURES="$BENCH_DIR/fixtures"
 DEST="$BENCH_DIR/dest"
 LOGS="$BENCH_DIR/logs"

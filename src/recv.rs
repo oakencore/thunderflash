@@ -12,8 +12,8 @@ use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
     ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, HANDSHAKE_LEN, HANDSHAKE_TIMEOUT,
-    IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN, ct_eq, decode_handshake, encode_bitmap, queue_depth,
-    sanitize, set_timeouts,
+    IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN, ct_eq, decode_handshake, encode_bitmap, hash_update,
+    queue_depth, sanitize, set_timeouts,
 };
 
 /// Work handed to the writer thread. `Begin` carries the descriptors the
@@ -158,8 +158,10 @@ fn write_loop(
 }
 
 /// Middle stage: hashes each buffer on its way from the network thread to the
-/// writer, so socket reads, hashing and disk writes all overlap. BLAKE3 is
-/// sequential over one file, so this thread is the receiver's hashing budget.
+/// writer, so socket reads, hashing and disk writes all overlap. The hash
+/// state itself stays on this one thread (order is order), but the
+/// compression work inside `hash_update` spreads across cores for buffers at
+/// or above `RAYON_MIN`.
 ///
 /// It only computes; the network thread compares and decides, which keeps the
 /// unlink contract exactly where it was — the writer, and only the writer,
@@ -172,7 +174,7 @@ fn hash_loop(rx: ChanReceiver<Msg>, tx: SyncSender<Msg>, diag: Option<Arc<Diag>>
         let forward = match msg {
             Msg::Data { buf, len } => {
                 let started = Instant::now();
-                hasher.update(&buf[..len]);
+                hash_update(&mut hasher, &buf[..len]);
                 if let Some(diag) = diag {
                     add_elapsed(&diag.hash_nanos, started);
                 }
