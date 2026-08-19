@@ -130,11 +130,12 @@ transfer can deliver silently corrupted bytes and still report success. Leave
 it on unless the link is genuinely faster than the hashing cores, or the
 destination disk is the limit and you want every byte of it.
 
-Both Macs must run the same protocol version (currently v3, which added the
-manifest exchange). Only the receiver parses a handshake, so only the
-receiving Mac names a mismatch (`sender speaks protocol v1, this build speaks
-v3`); the sending Mac just sees the connection close, as with a mistyped
-phrase.
+This build speaks protocol v3 (the manifest exchange) and v4 (the same data
+plane over several parallel flows; see Parallel flows). Only the receiver
+parses a handshake, so only the receiving Mac names a mismatch (an old
+v3-only build facing a v4 sender says `sender speaks protocol v4, this build
+speaks v3`); the sending Mac just sees the connection close, as with a
+mistyped phrase.
 
 ## Durability
 
@@ -163,6 +164,38 @@ or a drive that lies about its cache.
 
 The cost scales with file count, not bytes: 10,000 × 1 MiB files went from
 6.1 s to 40.4 s; one 16 GiB file was unchanged.
+
+## Parallel flows
+
+A session is one TCP flow by default. `TF_STREAMS=N` on the sending side
+(`N` = 2..=16) speaks v4 instead: the primary flow still carries the manifest
+and the "already held" bitmap, the other `N-1` flows stream the entries they
+are dealt in walk order (round-robin), and the single acknowledgement still
+goes out only once every flow is committed and the cross-flow directory
+flush has passed (see Durability). Nothing on the wire changes shape; only
+the handshake gains a flow count and index.
+
+Each flow owns its pipeline: its own pool of 4 MiB buffers (16 MiB per flow
+at the default queue depth) and its own socket buffers (8-16 MiB), plus its
+own reader/hash/writer threads. So flow memory scales with `N` — `N=4` holds
+roughly four times the flow state of `N=1` on each Mac.
+
+Whether several flows beat one depends on the cable and the pair, which is
+why this is opt-in. Check the raw ceiling first with the probe example (no
+framing, no hashing — pure socket throughput):
+
+```sh
+# receiving Mac, then sending Mac — one stream:
+cargo run --release --example streams_probe recv 172.10.0.1 6000 1
+cargo run --release --example streams_probe send 172.10.0.1 6000 1 16
+# …and the same pair, four streams:
+cargo run --release --example streams_probe recv 172.10.0.1 6000 4
+cargo run --release --example streams_probe send 172.10.0.1 6000 4 16
+```
+
+If four flows do not clearly beat one, keep the default. If they do, run the
+sender with `TF_STREAMS=4 tf send ...`; the receiver needs only the same
+build, not the variable.
 
 ## Options
 

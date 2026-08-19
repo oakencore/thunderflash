@@ -12,9 +12,9 @@ use std::time::Instant;
 use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
-    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, HANDSHAKE_LEN, HANDSHAKE_TIMEOUT,
-    IDLE_TIMEOUT, Kind, NOCACHE_MIN, Stats, TOKEN_LEN, ct_eq, decode_handshake, encode_bitmap,
-    hash_update, queue_depth, sanitize, set_timeouts,
+    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, Kind,
+    MAX_STREAMS, NOCACHE_MIN, Stats, TOKEN_LEN, VERSION_MULTI, ct_eq, encode_bitmap, hash_update,
+    queue_depth, read_handshake, sanitize, set_timeouts,
 };
 
 /// Work handed to the writer thread. `Begin` carries the descriptors the
@@ -337,13 +337,27 @@ impl Receiver {
         // session this process will ever accept. Both loops treat any read or
         // write error as fatal-and-clean-up, so a timeout needs no new path.
         set_timeouts(&stream, HANDSHAKE_TIMEOUT)?;
-        let verify = self.verify_handshake(&mut stream, peer)?;
+        let (verify, streams) = self.verify_handshake(&mut stream, peer)?;
         set_timeouts(&stream, IDLE_TIMEOUT)?;
         let mut staged = Staged::new(stream);
         let (skipped_files, skipped_bytes) = self.answer_manifest(&mut staged)?;
-        let mut stats = self.receive_entries(&mut staged, progress, verify)?;
-        stats.skipped_files = skipped_files;
-        stats.skipped_bytes = skipped_bytes;
+
+        let stats = match streams {
+            // v3: the single-stream path, unchanged.
+            None => {
+                let mut stats = self.receive_entries(&mut staged, progress, verify)?;
+                stats.skipped_files = skipped_files;
+                stats.skipped_bytes = skipped_bytes;
+                stats
+            }
+            // v4: the band arrives next; one pipeline per flow, one ACK.
+            Some((count, _index)) => {
+                let mut stats = self.accept_multi(&mut staged, count, progress, verify)?;
+                stats.skipped_files = skipped_files;
+                stats.skipped_bytes = skipped_bytes;
+                stats
+            }
+        };
         Ok(stats)
     }
 
@@ -415,15 +429,18 @@ impl Receiver {
         )
     }
 
-    /// Returns whether the sender's stream carries digests to check.
+    /// Returns whether the sender's stream carries digests to check, and the
+    /// stream pairing when the sender speaks v4: `(count, index)` with the
+    /// primary connection — the one carrying the manifest — arriving first.
     fn verify_handshake(
         &self,
         stream: &mut TcpStream,
         peer: std::net::SocketAddr,
-    ) -> io::Result<bool> {
-        let mut buf = [0u8; HANDSHAKE_LEN];
-        stream.read_exact(&mut buf)?;
-        let (flags, token) = decode_handshake(&buf)?;
+    ) -> io::Result<(bool, Option<(u32, u32)>)> {
+        let hs = read_handshake(stream)?;
+        let flags = hs.flags;
+        let token = hs.token;
+        let streams = hs.streams;
         if !ct_eq(&token, &self.token) {
             eprintln!("refused a connection from {peer}: token mismatch");
             return Err(io::Error::new(
@@ -435,14 +452,40 @@ impl Receiver {
         if !verify {
             eprintln!("tf: content verification disabled by sender");
         }
-        Ok(verify)
+        if let Some((count, index)) = streams {
+            // The primary must come first — it carries the manifest — and it
+            // must be pairing with our own flow count.
+            if index != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("v4 stream index {index} arrived before the primary (index 0)"),
+                ));
+            }
+            // The sender decides the flow count; the receiver just
+            // accommodates it, bounded so a hostile handshake cannot pin
+            // unbounded memory.
+            if !(2..=MAX_STREAMS).contains(&count) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("v4 stream count {count} out of range (2..={MAX_STREAMS})"),
+                ));
+            }
+        }
+        Ok((verify, streams))
     }
 
-    fn receive_entries(
+    /// One stream's data phase: net thread on the given stream, with its own
+    /// hash and writer threads, until the terminator. Returns the stream's
+    /// own stats; the session-level interests — the final directory flush and
+    /// the ACK — stay with the caller, because in a v4 session they only make
+    /// sense once every stream has finished.
+    fn run_pipeline(
         &self,
         stream: &mut Staged,
         progress: &Progress,
         verify: bool,
+        durable: bool,
+        regs: Option<Arc<Mutex<DirRegistry>>>,
     ) -> io::Result<Stats> {
         let depth = queue_depth();
         let (tx, rx) = sync_channel::<Msg>(depth);
@@ -453,11 +496,6 @@ impl Receiver {
                 .expect("pool receiver is alive");
         }
         let writer_diag = self.diag.clone();
-        let durable = self.durable;
-        // A durable session must flush every directory that received an
-        // entry, so the net thread and the writer both record them here.
-        // Non-durable keeps it `None`: no registration, no final flush.
-        let regs = durable.then(|| Arc::new(Mutex::new(DirRegistry::new())));
         let writer_regs = regs.clone();
         let writer =
             std::thread::spawn(move || write_loop(rx, pool_tx, writer_diag, durable, writer_regs));
@@ -478,8 +516,7 @@ impl Receiver {
             (tx, None)
         };
 
-        let received =
-            self.read_entries(stream, &entry_tx, &pool_rx, progress, verify, regs.clone());
+        let received = self.read_entries(stream, &entry_tx, &pool_rx, progress, verify, regs);
         drop(entry_tx);
         // Both joins happen before any `?`: returning early on a hash-thread
         // panic would leave the writer detached, still holding a file it is
@@ -492,12 +529,148 @@ impl Receiver {
         if let Some(Err(_)) = hashed {
             return Err(io::Error::other("receiver hash thread panicked"));
         }
-        let stats = received?;
+        received
+    }
 
-        // Every file is already flushed by here; the names themselves live in
-        // the directories that received them, and each of those needs its own
-        // flush to survive a power cut.
-        if let Some(regs) = &regs {
+    /// The v3 data phase: one stream, ending in the session's directory flush
+    /// and the acknowledgement.
+    fn receive_entries(
+        &self,
+        stream: &mut Staged,
+        progress: &Progress,
+        verify: bool,
+    ) -> io::Result<Stats> {
+        let durable = self.durable;
+        // A durable session must flush every directory that received an
+        // entry, so the net thread and the writer both record them here.
+        // Non-durable keeps it `None`: no registration, no final flush.
+        let regs = durable.then(|| Arc::new(Mutex::new(DirRegistry::new())));
+        let flush = regs.clone();
+        let stats = self.run_pipeline(stream, progress, verify, durable, regs)?;
+        self.flush_directories(&flush)?;
+        // Only now is every byte committed, so it is safe to let the sender
+        // claim success.
+        stream.stream().write_all(&[ACK])?;
+        stream.stream().flush()?;
+        Ok(stats)
+    }
+
+    /// v4 data phase: the primary stream has answered the manifest, the other
+    /// connections arrive next, and every stream's pipeline then runs at
+    /// once. The acknowledgement goes out once — on the primary — after the
+    /// last byte of the last stream, past the single shared directory flush.
+    fn accept_multi(
+        &self,
+        primary: &mut Staged,
+        count: u32,
+        progress: &Progress,
+        verify: bool,
+    ) -> io::Result<Stats> {
+        let durable = self.durable;
+        // One shared registry across every stream: each directory that
+        // received an entry is flushed exactly once, before any ACK exists.
+        let regs = durable.then(|| Arc::new(Mutex::new(DirRegistry::new())));
+
+        // The sender opens the band right after its manifest exchange, so
+        // accept them all first, then run the pipelines concurrently.
+        let mut bands: Vec<(u32, TcpStream)> = Vec::with_capacity(count as usize - 1);
+        for _ in 0..(count - 1) {
+            let waiting = Instant::now();
+            let (mut stream, peer) = self.listener.accept()?;
+            if let Some(diag) = self.diag.as_deref() {
+                add_elapsed(&diag.accept_nanos, waiting);
+            }
+            sys::set_socket_buffers(stream.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
+            stream.set_nodelay(true)?;
+            set_timeouts(&stream, HANDSHAKE_TIMEOUT)?;
+            let hs = read_handshake(&mut stream)?;
+            let version = hs.version;
+            let flags = hs.flags;
+            let token = hs.token;
+            let streams = hs.streams;
+            if !ct_eq(&token, &self.token) {
+                eprintln!("refused a connection from {peer}: token mismatch");
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "token mismatch",
+                ));
+            }
+            if version != VERSION_MULTI {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("v4 band carried a v{version} handshake"),
+                ));
+            }
+            let Some((band_count, index)) = streams else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "v4 band stream carries no stream tail",
+                ));
+            };
+            if band_count != count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "band stream announces {band_count} streams, the primary announced {count}"
+                    ),
+                ));
+            }
+            if index == 0 || index >= count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("stream index {index} is not inside a {count}-stream session"),
+                ));
+            }
+            if (flags & FLAG_NO_VERIFY == 0) != verify {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "verify setting differs across v4 streams",
+                ));
+            }
+            set_timeouts(&stream, IDLE_TIMEOUT)?;
+            bands.push((index, stream));
+        }
+
+        let total = std::thread::scope(|s| {
+            // Band streams on their own threads, the primary on this one:
+            // one pipeline per flow, all sharing the durable registry.
+            let mut handles = Vec::with_capacity(bands.len());
+            for (index, stream) in bands {
+                let mut staged = Staged::new(stream);
+                let band_regs = regs.clone();
+                handles.push(s.spawn(move || {
+                    self.run_pipeline(&mut staged, progress, verify, durable, band_regs)
+                        .map_err(|err| io::Error::other(format!("v4 stream {index}: {err}")))
+                }));
+            }
+            let primary_stats =
+                self.run_pipeline(primary, progress, verify, durable, regs.clone())?;
+            let mut total = primary_stats;
+            for handle in handles {
+                let stats = handle
+                    .join()
+                    .map_err(|_| io::Error::other("receiver stream thread panicked"))?;
+                let stats = stats?;
+                total.files += stats.files;
+                total.bytes += stats.bytes;
+            }
+            Ok::<_, io::Error>(total)
+        })?;
+
+        self.flush_directories(&regs)?;
+
+        // One acknowledgement, on the primary: the sender treats only this
+        // byte as session success, and it exists only after every stream is
+        // committed and the shared directory flush has passed.
+        primary.stream().write_all(&[ACK])?;
+        primary.stream().flush()?;
+        Ok(total)
+    }
+
+    /// The final durable pass, between "every pipeline finished" and "the ACK
+    /// may exist".
+    fn flush_directories(&self, regs: &Option<Arc<Mutex<DirRegistry>>>) -> io::Result<()> {
+        if let Some(regs) = regs {
             let started = Instant::now();
             let result = regs
                 .lock()
@@ -506,14 +679,10 @@ impl Receiver {
             if let Some(diag) = self.diag.as_deref() {
                 add_elapsed(&diag.flush_nanos, started);
             }
-            result?;
+            result
+        } else {
+            Ok(())
         }
-
-        // Only now is every byte committed, so it is safe to let the sender
-        // claim success.
-        stream.stream().write_all(&[ACK])?;
-        stream.stream().flush()?;
-        Ok(stats)
     }
 
     fn read_entries(
@@ -901,7 +1070,7 @@ fn pump_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Entry, Kind};
+    use crate::wire::{Entry, HANDSHAKE_LEN, Kind};
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
 

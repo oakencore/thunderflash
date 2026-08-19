@@ -12,8 +12,8 @@ use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
     ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, IDLE_TIMEOUT, Kind, NOCACHE_MIN, Stats,
-    TOKEN_LEN, encode_handshake, hash_update, queue_depth, read_bitmap, set_timeouts,
-    write_terminator,
+    TOKEN_LEN, encode_handshake, encode_handshake_multi, hash_update, queue_depth, read_bitmap,
+    set_timeouts, streams_count, write_terminator,
 };
 
 pub struct Item {
@@ -194,6 +194,7 @@ pub fn send_to(
 /// `send_to` with verification opt-out and diagnostics attached. With
 /// `verify` false the hashing stage is not spawned at all and no digest ever
 /// reaches the wire; the receiver learns this from the handshake flags.
+/// `TF_STREAMS > 1` fans the session out over parallel flows.
 pub fn send_to_diag(
     peer: SocketAddrV4,
     paths: &[PathBuf],
@@ -202,6 +203,25 @@ pub fn send_to_diag(
     verify: bool,
     diag: Option<Arc<Diag>>,
 ) -> io::Result<Stats> {
+    send_to_diag_streamed(peer, paths, token, progress, verify, diag, streams_count())
+}
+
+/// `send_to_diag` with the flow count explicit, for callers that would
+/// rather not read the process environment. `streams == 1` is the plain v3
+/// session; `2..=MAX_STREAMS` speaks v4.
+pub fn send_to_diag_streamed(
+    peer: SocketAddrV4,
+    paths: &[PathBuf],
+    token: &[u8; TOKEN_LEN],
+    progress: &Progress,
+    verify: bool,
+    diag: Option<Arc<Diag>>,
+    streams: u32,
+) -> io::Result<Stats> {
+    if streams > 1 {
+        return send_multi(peer, paths, token, progress, verify, diag, streams);
+    }
+
     let started = Instant::now();
     let items = walk(paths)?;
     if let Some(diag) = &diag {
@@ -239,6 +259,40 @@ pub fn send_to_diag(
     let total_bytes: u64 = items.iter().map(|i| i.entry.size).sum();
     progress.set_totals(items.len() as u64, total_bytes);
 
+    let moved = send_lane(&mut stream, items, verify, progress, diag)?;
+    stats.files += moved.files;
+    stats.bytes += moved.bytes;
+
+    // Do not report success until the receiver says every byte landed.
+    read_ack(&mut stream)?;
+    Ok(stats)
+}
+
+/// One v4 flow: the reader, the hash stage, and the socket write loop for a
+/// share of the items, ending at the terminator. No manifest and no
+/// acknowledgement — those are session-level, owned by the caller.
+fn send_lane(
+    stream: &mut TcpStream,
+    items: Vec<Item>,
+    verify: bool,
+    progress: &Progress,
+    diag: Option<Arc<Diag>>,
+) -> io::Result<Stats> {
+    let mut stats = Stats::default();
+    send_lane_inner(stream, items, verify, progress, diag, &mut stats)?;
+    Ok(stats)
+}
+
+/// The body of a single-flow send, split out so `send_lane` and the v3 path
+/// share it.
+fn send_lane_inner(
+    stream: &mut TcpStream,
+    items: Vec<Item>,
+    verify: bool,
+    progress: &Progress,
+    diag: Option<Arc<Diag>>,
+    stats: &mut Stats,
+) -> io::Result<()> {
     let depth = queue_depth();
     // One buffer per queue slot, plus one being filled by the reader and one
     // being written to the socket. Any fewer and the pipeline stalls on
@@ -335,10 +389,13 @@ pub fn send_to_diag(
         return Err(io::Error::other("hash thread panicked"));
     }
 
-    write_terminator(&mut stream)?;
+    write_terminator(stream)?;
     stream.flush()?;
+    Ok(())
+}
 
-    // Do not report success until the receiver says every byte landed.
+/// The receiver's one byte of commitment, read on the primary stream.
+fn read_ack(stream: &mut TcpStream) -> io::Result<()> {
     let mut ack = [0u8; 1];
     stream.read_exact(&mut ack)?;
     if ack[0] != ACK {
@@ -347,6 +404,114 @@ pub fn send_to_diag(
             "receiver did not acknowledge",
         ));
     }
+    Ok(())
+}
+
+/// The v4 session: the same items, `TF_STREAMS` flows.
+///
+/// Only the primary (index 0) carries the manifest and bitmap; after that
+/// pairing it is indistinguishable from a band flow. Items are dealt
+/// round-robin, flow `i mod count`, so neighbours in the tree mostly share a
+/// flow and each flow's reads stay local. The band is paired fully before any
+/// data goes out, because the receiver starts accepting it only after it has
+/// answered the manifest.
+///
+/// Failure is not cancellable across flows: a lane that errors keeps its
+/// peers running until their data ends, and the session then resolves to
+/// failure when the primary fails or the acknowledgement never comes.
+fn send_multi(
+    peer: SocketAddrV4,
+    paths: &[PathBuf],
+    token: &[u8; TOKEN_LEN],
+    progress: &Progress,
+    verify: bool,
+    diag: Option<Arc<Diag>>,
+    streams: u32,
+) -> io::Result<Stats> {
+    let count = streams as usize;
+    let started = Instant::now();
+    let items = walk(paths)?;
+    if let Some(diag) = &diag {
+        add_elapsed(&diag.walk_nanos, started);
+    }
+
+    let flags = if verify { 0 } else { FLAG_NO_VERIFY };
+    let mut primary = TcpStream::connect(peer)?;
+    sys::set_socket_buffers(primary.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
+    primary.set_nodelay(true)?;
+    set_timeouts(&primary, IDLE_TIMEOUT)?;
+    primary.write_all(&encode_handshake_multi(flags, token, count as u32, 0))?;
+
+    // Manifest phase, on the primary only.
+    let mut manifest = Vec::new();
+    for item in &items {
+        manifest.extend_from_slice(&item.header);
+    }
+    write_terminator(&mut manifest)?;
+    primary.write_all(&manifest)?;
+    primary.flush()?;
+    let offered = items.iter().filter(|i| i.entry.kind == Kind::File).count();
+    let have = read_bitmap(&mut primary, offered)?;
+    let (items, mut stats) = keep_unskipped(items, &have);
+    // Totals only now: the bar would otherwise promise bytes the manifest has
+    // already established will never move.
+    let total_bytes: u64 = items.iter().map(|i| i.entry.size).sum();
+    progress.set_totals(items.len() as u64, total_bytes);
+
+    let mut lanes: Vec<Vec<Item>> = (0..count).map(|_| Vec::new()).collect();
+    for (i, item) in items.into_iter().enumerate() {
+        lanes[i % count].push(item);
+    }
+
+    // Pair the band before any data: the receiver only accepts it once its
+    // own manifest answer has gone out.
+    let mut bands = Vec::with_capacity(count - 1);
+    for index in 1..count {
+        let mut stream = TcpStream::connect(peer)?;
+        sys::set_socket_buffers(stream.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
+        stream.set_nodelay(true)?;
+        set_timeouts(&stream, IDLE_TIMEOUT)?;
+        stream.write_all(&encode_handshake_multi(
+            flags,
+            token,
+            count as u32,
+            index as u32,
+        ))?;
+        bands.push(stream);
+    }
+
+    let primary_items = std::mem::take(&mut lanes[0]);
+    let mut total = Stats::default();
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(bands.len());
+        for (i, mut stream) in bands.into_iter().enumerate() {
+            let lane = std::mem::take(&mut lanes[i + 1]);
+            let lane_diag = diag.clone();
+            let stream_index = i + 1;
+            handles.push(s.spawn(move || {
+                send_lane(&mut stream, lane, verify, progress, lane_diag)
+                    .map_err(|err| io::Error::other(format!("v4 stream {stream_index}: {err}")))
+            }));
+        }
+        let primary_stats = send_lane(&mut primary, primary_items, verify, progress, diag)?;
+        total.files += primary_stats.files;
+        total.bytes += primary_stats.bytes;
+        for handle in handles {
+            let lane_stats = handle
+                .join()
+                .map_err(|_| io::Error::other("sender lane thread panicked"))?;
+            let lane_stats = lane_stats?;
+            total.files += lane_stats.files;
+            total.bytes += lane_stats.bytes;
+        }
+        Ok::<_, io::Error>(())
+    })?;
+    stats.files += total.files;
+    stats.bytes += total.bytes;
+
+    // The session's single acknowledgement, on the primary, only after every
+    // flow finished and the receiver's shared directory flush passed.
+    read_ack(&mut primary)?;
     Ok(stats)
 }
 

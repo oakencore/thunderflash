@@ -21,6 +21,7 @@ Environment:
 | `TF_MEDIUM_COUNT` | `10000` | Number of 1 MiB files |
 | `TF_QUEUE_DEPTH` | `4` | Chunk buffers in flight per side; clamped to 1..=64 |
 | `RAYON_NUM_THREADS` | half of `hw.ncpu` | BLAKE3 parallel-hash pool size per end. Both ends are capped because they share one machine; unset it for the two-Mac procedure |
+| `TF_STREAMS` | `1` | Parallel flows for the session (2..=16 enables v4). `bench.sh` runs it at 1; the two-Mac procedure A/Bs 1 vs 4 |
 
 The script builds `target/release/examples/bench`, generates fixtures once
 (reused on later runs), then for each workload starts a receiver, reads the
@@ -89,6 +90,39 @@ Confirm jumbo frames actually pass before re-running
 (`ping -D -s 8000 <peer>`), re-run the same transfer, then revert (same
 commands with 1500, members last). Neither setting persists across a reboot,
 and `tf` never changes it itself — it only prints a hint when it sees 1500.
+
+### Parallel flows (TF_STREAMS)
+
+Before the protocol A/B, measure the link's raw ceiling with the probe
+(no framing, no hashing — pure socket throughput). Receiving Mac, then
+sending Mac, once with `N=1` and once with `N=4`:
+
+```sh
+# receiving Mac
+cargo run --release --example streams_probe recv 172.10.0.1 6000 1
+cargo run --release --example streams_probe recv 172.10.0.1 6000 4
+# sending Mac (16 GiB total, split evenly over the N flows)
+cargo run --release --example streams_probe send 172.10.0.1 6000 1 16
+cargo run --release --example streams_probe send 172.10.0.1 6000 4 16
+```
+
+If `N=4` does not clearly beat `N=1` here, stop: `tf` over the same cable
+will not beat it either, and the session stays at the default one flow.
+Otherwise A/B the real tool, both Macs running the same build — the variable
+matters on the sender only:
+
+```sh
+# receiving Mac
+tf recv /tmp/tf-dest
+# sending Mac
+tf send /tmp/tf-fix/large                      # one flow
+TF_STREAMS=4 tf send /tmp/tf-fix/large         # four flows
+```
+
+Record both endpoints' reported throughput; the receiver also prints its own
+wall time. Memory note: each flow holds its own 4 MiB buffer pool and socket
+buffers on both Macs, so `TF_STREAMS=4` is roughly four times the flow
+memory of the default.
 
 ### Measured: M5 MacBook Pro to M4 MacBook Pro (2026-08-18)
 
