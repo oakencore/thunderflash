@@ -8,8 +8,8 @@
 //! file semantics. Incompressible payload from a pre-filled buffer over N
 //! independent connections, each with the same socket options `tf` uses.
 //!
-//!   streams_probe recv 172.10.0.1 6000 4     the receiving Mac
-//!   streams_probe send 172.10.0.1 6000 4 16  the sending Mac
+//!   streams_probe recv 169.254.0.1 6000 4     the receiving Mac
+//!   streams_probe send 169.254.0.1 6000 4 16  the sending Mac
 //!
 //! `recv` opens N listeners on port..port+N-1 and drains each to EOF;
 //! `send` pushes <gib> GiB total, split evenly, then closes each flow.

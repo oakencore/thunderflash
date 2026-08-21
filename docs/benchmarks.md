@@ -99,11 +99,11 @@ sending Mac, once with `N=1` and once with `N=4`:
 
 ```sh
 # receiving Mac
-cargo run --release --example streams_probe recv 172.10.0.1 6000 1
-cargo run --release --example streams_probe recv 172.10.0.1 6000 4
+cargo run --release --example streams_probe recv 169.254.0.1 6000 1
+cargo run --release --example streams_probe recv 169.254.0.1 6000 4
 # sending Mac (16 GiB total, split evenly over the N flows)
-cargo run --release --example streams_probe send 172.10.0.1 6000 1 16
-cargo run --release --example streams_probe send 172.10.0.1 6000 4 16
+cargo run --release --example streams_probe send 169.254.0.1 6000 1 16
+cargo run --release --example streams_probe send 169.254.0.1 6000 4 16
 ```
 
 If `N=4` does not clearly beat `N=1` here, stop: `tf` over the same cable

@@ -185,12 +185,13 @@ why this is opt-in. Check the raw ceiling first with the probe example (no
 framing, no hashing — pure socket throughput):
 
 ```sh
+# 169.254.0.1 is the receiving Mac's bridge0 address (`ifconfig bridge0`).
 # receiving Mac, then sending Mac — one stream:
-cargo run --release --example streams_probe recv 172.10.0.1 6000 1
-cargo run --release --example streams_probe send 172.10.0.1 6000 1 16
+cargo run --release --example streams_probe recv 169.254.0.1 6000 1
+cargo run --release --example streams_probe send 169.254.0.1 6000 1 16
 # …and the same pair, four streams:
-cargo run --release --example streams_probe recv 172.10.0.1 6000 4
-cargo run --release --example streams_probe send 172.10.0.1 6000 4 16
+cargo run --release --example streams_probe recv 169.254.0.1 6000 4
+cargo run --release --example streams_probe send 169.254.0.1 6000 4 16
 ```
 
 If four flows do not clearly beat one, keep the default. If they do, run the
