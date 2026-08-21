@@ -378,6 +378,7 @@ fn a_symlink_with_a_wrong_digest_is_refused() {
 
 #[test]
 fn a_symlink_with_a_matching_digest_is_created() {
+    const LINK_MTIME: i64 = 1_700_000_000;
     let (dest, mut stream, handle) = session("link-ok", [30u8; TOKEN_LEN]);
     let target = b"big/large.bin";
 
@@ -387,7 +388,7 @@ fn a_symlink_with_a_matching_digest_is_created() {
         path: "link".into(),
         size: target.len() as u64,
         mode: 0o777,
-        mtime: 0,
+        mtime: LINK_MTIME,
     }
     .encode(&mut buf);
     buf.extend_from_slice(target);
@@ -401,6 +402,19 @@ fn a_symlink_with_a_matching_digest_is_created() {
     assert_eq!(
         std::fs::read_link(dest.join("link")).unwrap().to_str(),
         Some("big/large.bin")
+    );
+    // The link's own mtime is what the next manifest compares, so it must
+    // survive the trip: without the stamp, repeat transfers resend it.
+    assert_eq!(
+        std::fs::symlink_metadata(dest.join("link"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        LINK_MTIME as u64,
+        "the symlink's own mtime was not stamped"
     );
 }
 

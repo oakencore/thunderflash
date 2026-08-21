@@ -11,13 +11,36 @@ use std::time::{Instant, UNIX_EPOCH};
 use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
-    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN,
-    encode_handshake, queue_depth, read_bitmap, set_timeouts, write_terminator,
+    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, IDLE_TIMEOUT, Kind, NOCACHE_MIN, Stats,
+    TOKEN_LEN, encode_handshake, encode_handshake_multi, hash_update, queue_depth, read_bitmap,
+    set_timeouts, streams_count, write_terminator,
 };
 
 pub struct Item {
     pub abs: PathBuf,
     pub entry: Entry,
+    /// The header as it travels on the wire, encoded once at the walk so the
+    /// manifest and the data phase cannot drift apart and neither encodes
+    /// twice.
+    pub header: Vec<u8>,
+}
+
+fn make_item(abs: &Path, rel: String, kind: Kind, size: u64, mode: u32, mtime: i64) -> Item {
+    let entry = Entry {
+        kind,
+        path: rel,
+        size,
+        mode,
+        mtime,
+    };
+    // Kind + length + size + mode + mtime, then the path.
+    let mut header = Vec::with_capacity(23 + entry.path.len());
+    entry.encode(&mut header);
+    Item {
+        abs: abs.to_path_buf(),
+        entry,
+        header,
+    }
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> i64 {
@@ -61,30 +84,19 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
                 format!("symlink target of {abs:?} is not UTF-8"),
             )
         })?;
-        items.push(Item {
-            abs: abs.to_path_buf(),
-            entry: Entry {
-                kind: Kind::Symlink,
-                path: rel,
-                size: target.len() as u64,
-                mode,
-                mtime,
-            },
-        });
+        items.push(make_item(
+            abs,
+            rel,
+            Kind::Symlink,
+            target.len() as u64,
+            mode,
+            mtime,
+        ));
         return Ok(());
     }
 
     if meta.is_dir() {
-        items.push(Item {
-            abs: abs.to_path_buf(),
-            entry: Entry {
-                kind: Kind::Dir,
-                path: rel.clone(),
-                size: 0,
-                mode,
-                mtime,
-            },
-        });
+        items.push(make_item(abs, rel.clone(), Kind::Dir, 0, mode, mtime));
         let mut children: Vec<_> = std::fs::read_dir(abs)?.collect::<Result<_, _>>()?;
         children.sort_by_key(|c| c.file_name());
         for child in children {
@@ -108,16 +120,7 @@ fn visit(abs: &Path, rel: String, items: &mut Vec<Item>) -> io::Result<()> {
         return Ok(());
     }
 
-    items.push(Item {
-        abs: abs.to_path_buf(),
-        entry: Entry {
-            kind: Kind::File,
-            path: rel,
-            size: meta.len(),
-            mode,
-            mtime,
-        },
-    });
+    items.push(make_item(abs, rel, Kind::File, meta.len(), mode, mtime));
     Ok(())
 }
 
@@ -141,8 +144,10 @@ enum Msg {
 
 /// Middle stage: hashes each chunk between the reader and the socket writer,
 /// so disk reads, hashing and socket writes overlap instead of taking turns.
-/// BLAKE3 is sequential over one file, so this thread is the sender's hashing
-/// budget. Buffers pass straight through; the pool still bounds memory.
+/// The hash state itself stays on this one thread (order is order), but the
+/// compression work inside `hash_update` spreads across cores for buffers at
+/// or above `RAYON_MIN`. Buffers pass straight through; the pool still bounds
+/// memory.
 fn hash_items(rx: Pool<io::Result<Msg>>, tx: SyncSender<io::Result<Msg>>, diag: Option<Arc<Diag>>) {
     let diag = diag.as_deref();
     let mut hasher = blake3::Hasher::new();
@@ -151,7 +156,7 @@ fn hash_items(rx: Pool<io::Result<Msg>>, tx: SyncSender<io::Result<Msg>>, diag: 
         let forward = match message {
             Ok(Msg::Chunk { buf, len }) => {
                 let started = Instant::now();
-                hasher.update(&buf[..len]);
+                hash_update(&mut hasher, &buf[..len]);
                 if let Some(diag) = diag {
                     add_elapsed(&diag.hash_nanos, started);
                 }
@@ -189,6 +194,7 @@ pub fn send_to(
 /// `send_to` with verification opt-out and diagnostics attached. With
 /// `verify` false the hashing stage is not spawned at all and no digest ever
 /// reaches the wire; the receiver learns this from the handshake flags.
+/// `TF_STREAMS > 1` fans the session out over parallel flows.
 pub fn send_to_diag(
     peer: SocketAddrV4,
     paths: &[PathBuf],
@@ -197,6 +203,25 @@ pub fn send_to_diag(
     verify: bool,
     diag: Option<Arc<Diag>>,
 ) -> io::Result<Stats> {
+    send_to_diag_streamed(peer, paths, token, progress, verify, diag, streams_count())
+}
+
+/// `send_to_diag` with the flow count explicit, for callers that would
+/// rather not read the process environment. `streams == 1` is the plain v3
+/// session; `2..=MAX_STREAMS` speaks v4.
+pub fn send_to_diag_streamed(
+    peer: SocketAddrV4,
+    paths: &[PathBuf],
+    token: &[u8; TOKEN_LEN],
+    progress: &Progress,
+    verify: bool,
+    diag: Option<Arc<Diag>>,
+    streams: u32,
+) -> io::Result<Stats> {
+    if streams > 1 {
+        return send_multi(peer, paths, token, progress, verify, diag, streams);
+    }
+
     let started = Instant::now();
     let items = walk(paths)?;
     if let Some(diag) = &diag {
@@ -220,7 +245,7 @@ pub fn send_to_diag(
     // symlink target is smaller than the bit that would describe it.
     let mut manifest = Vec::new();
     for item in &items {
-        item.entry.encode(&mut manifest);
+        manifest.extend_from_slice(&item.header);
     }
     write_terminator(&mut manifest)?;
     stream.write_all(&manifest)?;
@@ -234,6 +259,40 @@ pub fn send_to_diag(
     let total_bytes: u64 = items.iter().map(|i| i.entry.size).sum();
     progress.set_totals(items.len() as u64, total_bytes);
 
+    let moved = send_lane(&mut stream, items, verify, progress, diag)?;
+    stats.files += moved.files;
+    stats.bytes += moved.bytes;
+
+    // Do not report success until the receiver says every byte landed.
+    read_ack(&mut stream)?;
+    Ok(stats)
+}
+
+/// One v4 flow: the reader, the hash stage, and the socket write loop for a
+/// share of the items, ending at the terminator. No manifest and no
+/// acknowledgement — those are session-level, owned by the caller.
+fn send_lane(
+    stream: &mut TcpStream,
+    items: Vec<Item>,
+    verify: bool,
+    progress: &Progress,
+    diag: Option<Arc<Diag>>,
+) -> io::Result<Stats> {
+    let mut stats = Stats::default();
+    send_lane_inner(stream, items, verify, progress, diag, &mut stats)?;
+    Ok(stats)
+}
+
+/// The body of a single-flow send, split out so `send_lane` and the v3 path
+/// share it.
+fn send_lane_inner(
+    stream: &mut TcpStream,
+    items: Vec<Item>,
+    verify: bool,
+    progress: &Progress,
+    diag: Option<Arc<Diag>>,
+    stats: &mut Stats,
+) -> io::Result<()> {
     let depth = queue_depth();
     // One buffer per queue slot, plus one being filled by the reader and one
     // being written to the socket. Any fewer and the pipeline stalls on
@@ -330,10 +389,13 @@ pub fn send_to_diag(
         return Err(io::Error::other("hash thread panicked"));
     }
 
-    write_terminator(&mut stream)?;
+    write_terminator(stream)?;
     stream.flush()?;
+    Ok(())
+}
 
-    // Do not report success until the receiver says every byte landed.
+/// The receiver's one byte of commitment, read on the primary stream.
+fn read_ack(stream: &mut TcpStream) -> io::Result<()> {
     let mut ack = [0u8; 1];
     stream.read_exact(&mut ack)?;
     if ack[0] != ACK {
@@ -342,6 +404,114 @@ pub fn send_to_diag(
             "receiver did not acknowledge",
         ));
     }
+    Ok(())
+}
+
+/// The v4 session: the same items, `TF_STREAMS` flows.
+///
+/// Only the primary (index 0) carries the manifest and bitmap; after that
+/// pairing it is indistinguishable from a band flow. Items are dealt
+/// round-robin, flow `i mod count`, so neighbours in the tree mostly share a
+/// flow and each flow's reads stay local. The band is paired fully before any
+/// data goes out, because the receiver starts accepting it only after it has
+/// answered the manifest.
+///
+/// Failure is not cancellable across flows: a lane that errors keeps its
+/// peers running until their data ends, and the session then resolves to
+/// failure when the primary fails or the acknowledgement never comes.
+fn send_multi(
+    peer: SocketAddrV4,
+    paths: &[PathBuf],
+    token: &[u8; TOKEN_LEN],
+    progress: &Progress,
+    verify: bool,
+    diag: Option<Arc<Diag>>,
+    streams: u32,
+) -> io::Result<Stats> {
+    let count = streams as usize;
+    let started = Instant::now();
+    let items = walk(paths)?;
+    if let Some(diag) = &diag {
+        add_elapsed(&diag.walk_nanos, started);
+    }
+
+    let flags = if verify { 0 } else { FLAG_NO_VERIFY };
+    let mut primary = TcpStream::connect(peer)?;
+    sys::set_socket_buffers(primary.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
+    primary.set_nodelay(true)?;
+    set_timeouts(&primary, IDLE_TIMEOUT)?;
+    primary.write_all(&encode_handshake_multi(flags, token, count as u32, 0))?;
+
+    // Manifest phase, on the primary only.
+    let mut manifest = Vec::new();
+    for item in &items {
+        manifest.extend_from_slice(&item.header);
+    }
+    write_terminator(&mut manifest)?;
+    primary.write_all(&manifest)?;
+    primary.flush()?;
+    let offered = items.iter().filter(|i| i.entry.kind == Kind::File).count();
+    let have = read_bitmap(&mut primary, offered)?;
+    let (items, mut stats) = keep_unskipped(items, &have);
+    // Totals only now: the bar would otherwise promise bytes the manifest has
+    // already established will never move.
+    let total_bytes: u64 = items.iter().map(|i| i.entry.size).sum();
+    progress.set_totals(items.len() as u64, total_bytes);
+
+    let mut lanes: Vec<Vec<Item>> = (0..count).map(|_| Vec::new()).collect();
+    for (i, item) in items.into_iter().enumerate() {
+        lanes[i % count].push(item);
+    }
+
+    // Pair the band before any data: the receiver only accepts it once its
+    // own manifest answer has gone out.
+    let mut bands = Vec::with_capacity(count - 1);
+    for index in 1..count {
+        let mut stream = TcpStream::connect(peer)?;
+        sys::set_socket_buffers(stream.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
+        stream.set_nodelay(true)?;
+        set_timeouts(&stream, IDLE_TIMEOUT)?;
+        stream.write_all(&encode_handshake_multi(
+            flags,
+            token,
+            count as u32,
+            index as u32,
+        ))?;
+        bands.push(stream);
+    }
+
+    let primary_items = std::mem::take(&mut lanes[0]);
+    let mut total = Stats::default();
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(bands.len());
+        for (i, mut stream) in bands.into_iter().enumerate() {
+            let lane = std::mem::take(&mut lanes[i + 1]);
+            let lane_diag = diag.clone();
+            let stream_index = i + 1;
+            handles.push(s.spawn(move || {
+                send_lane(&mut stream, lane, verify, progress, lane_diag)
+                    .map_err(|err| io::Error::other(format!("v4 stream {stream_index}: {err}")))
+            }));
+        }
+        let primary_stats = send_lane(&mut primary, primary_items, verify, progress, diag)?;
+        total.files += primary_stats.files;
+        total.bytes += primary_stats.bytes;
+        for handle in handles {
+            let lane_stats = handle
+                .join()
+                .map_err(|_| io::Error::other("sender lane thread panicked"))?;
+            let lane_stats = lane_stats?;
+            total.files += lane_stats.files;
+            total.bytes += lane_stats.bytes;
+        }
+        Ok::<_, io::Error>(())
+    })?;
+    stats.files += total.files;
+    stats.bytes += total.bytes;
+
+    // The session's single acknowledgement, on the primary, only after every
+    // flow finished and the receiver's shared directory flush passed.
+    read_ack(&mut primary)?;
     Ok(stats)
 }
 
@@ -380,15 +550,15 @@ fn read_items(
 ) {
     let diag = diag.as_deref();
     for item in items {
-        progress.set_current(&item.entry.path);
+        let Item { abs, entry, header } = item;
+        progress.set_current(&entry.path);
 
-        let mut header = Vec::with_capacity(64 + item.entry.path.len());
-        item.entry.encode(&mut header);
+        // The header left the walk already encoded.
         if tx.send(Ok(Msg::Header(header))).is_err() {
             return;
         }
         if let Some(diag) = diag {
-            match item.entry.kind {
+            match entry.kind {
                 Kind::Dir => &diag.dirs,
                 Kind::Symlink => &diag.symlinks,
                 Kind::File | Kind::End => &diag.files,
@@ -396,23 +566,23 @@ fn read_items(
             .fetch_add(1, Relaxed);
         }
 
-        let result = match item.entry.kind {
+        let result = match entry.kind {
             // Directories are header-only.
             Kind::Dir | Kind::End => Ok(()),
-            Kind::Symlink => match std::fs::read_link(&item.abs) {
+            Kind::Symlink => match std::fs::read_link(&abs) {
                 Ok(target) => {
                     let bytes = target.to_string_lossy().into_owned().into_bytes();
                     // The header announcing this length is already on the
                     // wire. A link repointed since the walk would leave the
                     // receiver framing the next entry from the wrong offset,
                     // so abort here the way a shrinking file does.
-                    if bytes.len() as u64 != item.entry.size {
+                    if bytes.len() as u64 != entry.size {
                         let _ = tx.send(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
                                 "{} changed during transfer: announced {} bytes, target is now {}",
-                                item.entry.path,
-                                item.entry.size,
+                                entry.path,
+                                entry.size,
                                 bytes.len()
                             ),
                         )));
@@ -441,7 +611,7 @@ fn read_items(
                 }
                 Err(err) => Err(err),
             },
-            Kind::File => stream_file(&item, &tx, &pool, diag, verify),
+            Kind::File => stream_file(&abs, &entry, &tx, &pool, diag, verify),
         };
 
         if let Err(err) = result {
@@ -453,18 +623,23 @@ fn read_items(
 }
 
 fn stream_file(
-    item: &Item,
+    abs: &Path,
+    entry: &Entry,
     tx: &SyncSender<io::Result<Msg>>,
     pool: &Pool<Vec<u8>>,
     diag: Option<&Diag>,
     verify: bool,
 ) -> io::Result<()> {
-    let mut file = std::fs::File::open(&item.abs)?;
+    let mut file = std::fs::File::open(abs)?;
     // Keep a huge transfer from evicting the machine's entire page cache.
-    let _ = sys::set_nocache(file.as_raw_fd());
+    // Below NOCACHE_MIN the fcntl would cost more, per file, than the cache
+    // it protects.
+    if entry.size >= NOCACHE_MIN {
+        let _ = sys::set_nocache(file.as_raw_fd());
+    }
 
     let mut sent = 0u64;
-    while sent < item.entry.size {
+    while sent < entry.size {
         // Blocking here is the real backpressure: no free buffer means the
         // link has not drained what we already read.
         let Some(mut buf) = pooled_recv(pool, diag) else {
@@ -473,7 +648,7 @@ fn stream_file(
         };
         // Never read past the size we announced, so a file that grew mid
         // transfer still matches its header.
-        let want = (item.entry.size - sent).min(CHUNK as u64) as usize;
+        let want = (entry.size - sent).min(CHUNK as u64) as usize;
         let mut filled = 0;
         while filled < want {
             match file.read(&mut buf[filled..want]) {
@@ -490,8 +665,8 @@ fn stream_file(
                 io::ErrorKind::InvalidData,
                 format!(
                     "{} shrank during transfer: expected {} bytes, read {}",
-                    item.entry.path,
-                    item.entry.size,
+                    entry.path,
+                    entry.size,
                     sent + filled as u64
                 ),
             ));
@@ -587,13 +762,14 @@ mod tests {
                 mode: 0o644,
                 mtime: 0,
             },
+            header: Vec::new(),
         };
         let (tx, rx) = sync_channel::<io::Result<Msg>>(64);
         let (pool_tx, pool_rx) = sync_channel::<Vec<u8>>(64);
         for _ in 0..8 {
             pool_tx.send(vec![0u8; CHUNK]).unwrap();
         }
-        let result = stream_file(&item, &tx, &pool_rx, None, true);
+        let result = stream_file(&item.abs, &item.entry, &tx, &pool_rx, None, true);
         drop(tx);
         // Recycle so the pool never starves this single-threaded drive.
         let mut got = Vec::new();
@@ -654,20 +830,25 @@ mod tests {
     }
 
     fn item(kind: Kind, path: &str, size: u64) -> Item {
-        Item {
-            abs: PathBuf::from(path),
-            entry: Entry {
-                kind,
-                path: path.to_string(),
-                size,
-                mode: 0o644,
-                mtime: 0,
-            },
-        }
+        make_item(Path::new(path), path.to_string(), kind, size, 0o644, 0)
     }
 
     fn kept_paths(items: &[Item]) -> Vec<&str> {
         items.iter().map(|i| i.entry.path.as_str()).collect()
+    }
+
+    #[test]
+    fn the_walk_encoded_header_matches_the_entry_on_the_wire() {
+        for (kind, path, size) in [
+            (Kind::File, "a/b.bin", 12u64),
+            (Kind::Dir, "a", 0),
+            (Kind::Symlink, "l", 4096),
+        ] {
+            let got = make_item(Path::new(path), path.to_string(), kind, size, 0o644, 0);
+            let mut want = Vec::new();
+            got.entry.encode(&mut want);
+            assert_eq!(got.header, want, "mismatch for {path:?}");
+        }
     }
 
     #[test]

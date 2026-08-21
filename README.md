@@ -44,8 +44,15 @@ battery still sleeps the machine, so keep the lids open.
 mixed pair, so the link negotiated Thunderbolt 4 at 40 Gb/s — sending 29.7 GB
 of real media files:
 
-- default (BLAKE3-verified): **2.3 GB/s**, limited by one hashing core per side
+- default (BLAKE3-verified): **2.3 GB/s**, limited by hashing (pre-parallel figure; see next note)
 - `--no-verify`: **3.7 GB/s**, limited by disk and link; sender CPU near zero
+
+Verification hashes are now computed on BLAKE3's parallel path (spreading
+across cores for buffers of 256 KiB and up) rather than on one core, so
+verified transfers should now sit closer to the `--no-verify` number; this
+pair has not been re-measured with that change yet. On one machine running
+both ends of a benchmark, the two hash pools contend; `bench.sh` caps each
+at half the cores for that reason.
 
 Even a Thunderbolt 4 link outruns the hasher; a TB5-to-TB5 pair (80 Gb/s) is
 unmeasured and can only widen the gap.
@@ -86,12 +93,20 @@ directory entries, and says how many files it skipped.
 Contents are not compared. A destination file edited to the same size and
 timestamp is left alone; delete it to force a fresh copy.
 
-Files are replaced atomically. The receiver writes to `.name.tf-partial`
-beside the target and renames over the real name only once the last byte has
-arrived and verified, so an interrupted transfer costs the temp file and never
-the copy that was already there. Names too long to carry the prefix and suffix
-(over 243 characters) are written in place instead, and those can still be
-lost to an interrupted run.
+Files are replaced atomically. The receiver writes to a
+`.name.a1b2c3d4.tf-partial` scratch file beside the target and renames it over
+the real name only once the last byte has arrived and verified, so an
+interrupted transfer costs the temp file and never the copy that was already
+there. Names too long to carry the prefix and suffix (over 243 characters) are
+written in place instead, and those can still be lost to an interrupted run.
+
+The scratch name is randomized for exactly this reason: a transfer that is
+killed without running its cleanup — SIGKILL, a power cut, a crash, or even
+SIGINT on a path that does not handle it — can leave a partial file behind,
+and every later run opens fresh scratch names, so an old partial is never
+silently adopted as someone else's in-progress file. It is inert but it is not
+deleted on the next run; find it with `find DEST -name '.*.tf-partial'` and
+remove the strays yourself.
 
 ## Content verification
 
@@ -102,22 +117,25 @@ Neither side reads the data twice. A mismatch discards the partial file, fails
 with the offending path and withholds the acknowledgement, so the sender
 reports failure too.
 
-Verification is on by default and caps throughput at one BLAKE3 core (about
-2.5 GB/s). `tf send --no-verify` turns it off for that run — no hashing on
-either end, no digests on the wire; the receiver prints
+Verification is on by default; its hash runs on BLAKE3's parallel path, so it
+costs a few cores rather than the whole budget a single hasher used to take.
+On the 40 Gb/s pair above, a pre-parallel build lost 39% to it; a verified
+transfer on the current build should sit close to the `--no-verify` number.
+`tf send --no-verify` turns it off for that run — no hashing on either end,
+no digests on the wire; the receiver prints
 `content verification disabled by sender`. There is no receiver-side flag.
 
 The trade-off is real: TCP's 16-bit checksum is weak, so a `--no-verify`
 transfer can deliver silently corrupted bytes and still report success. Leave
-it on unless the link is genuinely faster than the hasher — on the 40 Gb/s
-link above it bought 39%; on slower links, or against a slow destination
-disk, it buys nothing.
+it on unless the link is genuinely faster than the hashing cores, or the
+destination disk is the limit and you want every byte of it.
 
-Both Macs must run the same protocol version (currently v3, which added the
-manifest exchange). Only the receiver parses a handshake, so only the
-receiving Mac names a mismatch (`sender speaks protocol v1, this build speaks
-v3`); the sending Mac just sees the connection close, as with a mistyped
-phrase.
+This build speaks protocol v3 (the manifest exchange) and v4 (the same data
+plane over several parallel flows; see Parallel flows). Only the receiver
+parses a handshake, so only the receiving Mac names a mismatch (an old
+v3-only build facing a v4 sender says `sender speaks protocol v4, this build
+speaks v3`); the sending Mac just sees the connection close, as with a
+mistyped phrase.
 
 ## Durability
 
@@ -128,28 +146,65 @@ it.
 
 `tf recv --durable` withholds the acknowledgement until each regular file has
 been flushed with `F_FULLFSYNC` (which asks the drive to empty its own write
-cache) and the destination root directory has been flushed too. A file is
+cache) and every directory that received an entry has been flushed too —
+usually many subdirectories, always including the destination root. A file is
 flushed after its mtime is stamped, so the timestamp is persisted with the
-contents. Where the filesystem does not support `F_FULLFSYNC`, `tf` falls back
-to `fsync` and prints one warning. Any other flush failure discards the
-partial file and fails the transfer, the same as a write error.
+contents; a directory is flushed after the final rename, mkdir or symlink that
+landed in it, so the name itself survives the same power cut. Where the
+filesystem does not support `F_FULLFSYNC`, `tf` falls back to `fsync` and
+prints one warning. Any other flush failure discards the partial file and
+fails the transfer, the same as a write error.
+
+Symlinks have no data of their own: their directory entry is durable once the
+directory that received it is flushed, like any other entry, and their mtime is
+stamped so the next manifest treats them as held.
 
 `--durable` is no defence against hardware, firmware or filesystem corruption,
-or a drive that lies about its cache. Symlinks are not flushed, and
-directories below the destination root are not individually flushed, so an
-intermediate directory entry can still be lost even though the file it named
-was flushed.
+or a drive that lies about its cache.
 
 The cost scales with file count, not bytes: 10,000 × 1 MiB files went from
 6.1 s to 40.4 s; one 16 GiB file was unchanged.
+
+## Parallel flows
+
+A session is one TCP flow by default. `TF_STREAMS=N` on the sending side
+(`N` = 2..=16) speaks v4 instead: the primary flow still carries the manifest
+and the "already held" bitmap, the other `N-1` flows stream the entries they
+are dealt in walk order (round-robin), and the single acknowledgement still
+goes out only once every flow is committed and the cross-flow directory
+flush has passed (see Durability). Nothing on the wire changes shape; only
+the handshake gains a flow count and index.
+
+Each flow owns its pipeline: its own pool of 4 MiB buffers (16 MiB per flow
+at the default queue depth) and its own socket buffers (8-16 MiB), plus its
+own reader/hash/writer threads. So flow memory scales with `N` — `N=4` holds
+roughly four times the flow state of `N=1` on each Mac.
+
+Whether several flows beat one depends on the cable and the pair, which is
+why this is opt-in. Check the raw ceiling first with the probe example (no
+framing, no hashing — pure socket throughput):
+
+```sh
+# 169.254.0.1 is the receiving Mac's bridge0 address (`ifconfig bridge0`).
+# receiving Mac, then sending Mac — one stream:
+cargo run --release --example streams_probe recv 169.254.0.1 6000 1
+cargo run --release --example streams_probe send 169.254.0.1 6000 1 16
+# …and the same pair, four streams:
+cargo run --release --example streams_probe recv 169.254.0.1 6000 4
+cargo run --release --example streams_probe send 169.254.0.1 6000 4 16
+```
+
+If four flows do not clearly beat one, keep the default. If they do, run the
+sender with `TF_STREAMS=4 tf send ...`; the receiver needs only the same
+build, not the variable.
 
 ## Options
 
 ```
 tf recv [DIR]              Receive into DIR (default: current directory)
   --port <PORT>            Fixed TCP port (default: any free port)
-  --durable                Flush files and the destination directory to
-                           permanent storage before acknowledging
+  --durable                Flush every file and every directory that received
+                            an entry to permanent storage before acknowledging
   --stats                  Print transfer diagnostics to stderr when done
 
 tf send <PATHS>...         Send files or directories

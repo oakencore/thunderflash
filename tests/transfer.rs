@@ -548,6 +548,130 @@ fn transfers_a_tree_with_durable_flushes() {
     );
 }
 
+/// `round_trip` with an explicit flow count: the sender speaks v4 when the
+/// count exceeds one and the receiver learns the pairing from the handshake.
+fn round_trip_streamed(
+    paths: &[PathBuf],
+    dest: &Path,
+    token: [u8; TOKEN_LEN],
+    streams: u32,
+    verify: bool,
+) -> (Stats, Stats) {
+    let receiver = Receiver::bind(dest, Ipv4Addr::LOCALHOST, 0, token).unwrap();
+    let port = receiver.port().unwrap();
+    let handle = std::thread::spawn(move || {
+        let progress = Progress::new("receiving");
+        receiver.accept_one(&progress).unwrap()
+    });
+
+    let progress = Progress::new("sending");
+    let sent = send::send_to_diag_streamed(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        paths,
+        &token,
+        &progress,
+        verify,
+        None,
+        streams,
+    )
+    .unwrap();
+    (sent, handle.join().unwrap())
+}
+
+/// A v4 session splits one tree across several parallel flows; every byte is
+/// still verified and lands exactly once, on whichever flow it was dealt to.
+#[test]
+fn a_multi_stream_transfer_delivers_the_whole_tree() {
+    let source = scratch("multi-src");
+    let dest = scratch("multi-dst");
+    build_tree(&source);
+    let token = [71u8; TOKEN_LEN];
+    let (sent, received) = round_trip_streamed(&[source.join("tree")], &dest, token, 4, true);
+
+    assert_eq!(sent.files, received.files);
+    assert_eq!(sent.bytes, received.bytes);
+    assert!(
+        sent.files >= 2002,
+        "a full tree means thousands of entries, got {}",
+        sent.files
+    );
+    assert_eq!(
+        std::fs::read(source.join("tree/big/large.bin")).unwrap(),
+        std::fs::read(dest.join("tree/big/large.bin")).unwrap(),
+    );
+    for i in [0u32, 7, 999, 1999] {
+        assert_eq!(
+            format!("file {i}"),
+            std::fs::read_to_string(dest.join(format!("tree/small/f{i:04}.txt"))).unwrap(),
+        );
+    }
+    assert_eq!(std::fs::read(dest.join("tree/zero.bin")).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::read_link(dest.join("tree/link"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "big/large.bin"
+    );
+}
+
+/// Durability over v4: the directory flush happens exactly once, after every
+/// flow has finished, so the commit is identical to the single-stream one.
+#[test]
+fn a_durable_multi_stream_transfer_commits_like_the_single_one() {
+    let source = scratch("multi-durable-src");
+    let dest = scratch("multi-durable-dst");
+    build_tree(&source);
+
+    let token = [72u8; TOKEN_LEN];
+    let receiver = Receiver::bind(&dest, Ipv4Addr::LOCALHOST, 0, token)
+        .unwrap()
+        .with_durable(true);
+    let port = receiver.port().unwrap();
+    let handle = std::thread::spawn(move || {
+        let progress = Progress::new("receiving");
+        receiver.accept_one(&progress).unwrap()
+    });
+
+    let progress = Progress::new("sending");
+    let sent = send::send_to_diag_streamed(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        &[source.join("tree")],
+        &token,
+        &progress,
+        true,
+        None,
+        4,
+    )
+    .unwrap();
+    let received = handle.join().unwrap();
+
+    assert_eq!(sent.files, received.files);
+    assert_eq!(sent.bytes, received.bytes);
+    assert_eq!(
+        std::fs::read(source.join("tree/big/large.bin")).unwrap(),
+        std::fs::read(dest.join("tree/big/large.bin")).unwrap(),
+    );
+}
+
+/// v4 with verification off: no digest ever travels, so the flow fans out a
+/// plain byte stream and the receiver accepts it as-is.
+#[test]
+fn a_no_verify_multi_stream_transfer_moves_the_bytes() {
+    let source = scratch("multi-nv-src");
+    let dest = scratch("multi-nv-dst");
+    build_tree(&source);
+    let token = [73u8; TOKEN_LEN];
+    let (sent, received) = round_trip_streamed(&[source.join("tree")], &dest, token, 3, false);
+
+    assert_eq!(sent.files, received.files);
+    assert_eq!(sent.bytes, received.bytes);
+    assert_eq!(
+        std::fs::read(source.join("tree/big/large.bin")).unwrap(),
+        std::fs::read(dest.join("tree/big/large.bin")).unwrap(),
+    );
+}
+
 /// Nothing to fsync at all: the flush path must not assume a file was opened.
 #[test]
 fn durable_survives_a_symlink_only_transfer() {

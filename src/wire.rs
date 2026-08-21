@@ -15,9 +15,19 @@ pub const MAGIC: u32 = 0x5446_4C53;
 /// answers with a bitmap of the files it already has, and the data phase
 /// omits those entirely.
 pub const VERSION: u8 = 3;
+/// v4 is the v3 data plane over several parallel TCP flows: the handshake
+/// gains a stream count and this connection's index, the manifest and bitmap
+/// travel on index 0, and every stream runs the otherwise-identical data
+/// phase. Off by default; see `streams_count`.
+pub const VERSION_MULTI: u8 = 4;
 pub const TOKEN_LEN: usize = 32;
 /// MAGIC(4) VERSION(1) FLAGS(1) TOKEN(32).
 pub const HANDSHAKE_LEN: usize = 6 + TOKEN_LEN;
+/// v4 tail of the handshake: both u32s little-endian.
+pub const STREAMS_EXTRA_LEN: usize = 8;
+/// The highest stream count a receiver will accept. Memory is bounded by
+/// each stream holding `queue_depth` × CHUNK of buffers.
+pub const MAX_STREAMS: u32 = 16;
 /// Sender opted out of verification: the stream carries NO digest frames.
 pub const FLAG_NO_VERIFY: u8 = 0x01;
 /// Every bit this build understands. A sender setting anything else is
@@ -31,6 +41,14 @@ pub const ACK: u8 = 0xFF;
 pub const CHUNK: usize = 4 * 1024 * 1024;
 /// Length of the BLAKE3 digest that follows every File and Symlink payload.
 pub const DIGEST_LEN: usize = 32;
+/// Buffers at or above this size are hashed with `Hasher::update_rayon`,
+/// which parallelises chunk compression across cores; below it the join
+/// overhead loses to the work, so it stays on plain `update`.
+pub const RAYON_MIN: usize = 256 * 1024;
+/// `F_NOCACHE` above this file size, both ends. The fcntl is one syscall per
+/// file; measured at ~13% of a 10k x 4 KiB run, where it protects almost
+/// nothing. For files at or above this it is amortised away.
+pub const NOCACHE_MIN: u64 = 1024 * 1024;
 pub type Digest = [u8; DIGEST_LEN];
 
 /// A peer that has said nothing for this long is gone, not slow: both ends
@@ -66,10 +84,39 @@ pub fn queue_depth() -> usize {
     *DEPTH.get_or_init(|| clamp_depth(std::env::var("TF_QUEUE_DEPTH").ok().as_deref()))
 }
 
+/// Parallel flows for a v4 transfer, from `TF_STREAMS` on the sending end.
+///
+/// 1 (the default) is a plain v3 session, byte for byte. Only the sender
+/// needs the knob: it announces the flow count in the handshake and the
+/// receiver simply accommodates it (bounded by `MAX_STREAMS`). A build that
+/// cannot speak v4 rejects the handshake with a version error instead.
+pub fn streams_count() -> u32 {
+    static COUNT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        std::env::var("TF_STREAMS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(1)
+            .min(MAX_STREAMS)
+    })
+}
+
 /// One-shot digest of a whole payload. The transfer paths hash incrementally
 /// as bytes pass through; this is for short payloads and for tests.
 pub fn digest(bytes: &[u8]) -> Digest {
     *blake3::hash(bytes).as_bytes()
+}
+
+/// Incremental hash of one pooled buffer, on whichever BLAKE3 path suits its
+/// size: `update_rayon` pays a join overhead that small buffers do not earn
+/// back, so they stay on the plain path.
+pub fn hash_update(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    if bytes.len() >= RAYON_MIN {
+        hasher.update_rayon(bytes);
+    } else {
+        hasher.update(bytes);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -181,30 +228,65 @@ impl Entry {
     }
 }
 
+/// The v3 handshake: one flow, no stream tail.
 pub fn encode_handshake(flags: u8, token: &[u8; TOKEN_LEN]) -> [u8; HANDSHAKE_LEN] {
+    base_handshake(VERSION, flags, token)
+}
+
+/// The v4 handshake: the v3 prefix with the version byte set to
+/// `VERSION_MULTI`, followed by the stream count and this connection's index.
+pub fn encode_handshake_multi(
+    flags: u8,
+    token: &[u8; TOKEN_LEN],
+    count: u32,
+    index: u32,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = base_handshake(VERSION_MULTI, flags, token).into();
+    out.extend_from_slice(&encode_streams(count, index));
+    out
+}
+
+fn base_handshake(version: u8, flags: u8, token: &[u8; TOKEN_LEN]) -> [u8; HANDSHAKE_LEN] {
     let mut buf = [0u8; HANDSHAKE_LEN];
     buf[..4].copy_from_slice(&MAGIC.to_le_bytes());
-    buf[4] = VERSION;
+    buf[4] = version;
     buf[5] = flags;
     buf[6..].copy_from_slice(token);
     buf
 }
 
-/// Parse a handshake into its flags and token. Rejects a foreign protocol, a
-/// version we do not speak, and any flag bit we do not understand — all before
-/// the token is even compared, since none of them can be honoured.
-pub fn decode_handshake(buf: &[u8; HANDSHAKE_LEN]) -> io::Result<(u8, [u8; TOKEN_LEN])> {
+/// Pack a v4 stream tail: total stream count, then this stream's index.
+pub fn encode_streams(count: u32, index: u32) -> [u8; STREAMS_EXTRA_LEN] {
+    let mut buf = [0u8; STREAMS_EXTRA_LEN];
+    buf[..4].copy_from_slice(&count.to_le_bytes());
+    buf[4..].copy_from_slice(&index.to_le_bytes());
+    buf
+}
+
+pub fn decode_streams(buf: &[u8; STREAMS_EXTRA_LEN]) -> (u32, u32) {
+    (
+        u32::from_le_bytes(buf[..4].try_into().unwrap()),
+        u32::from_le_bytes(buf[4..].try_into().unwrap()),
+    )
+}
+
+/// Parse a handshake into its version, flags and token. Rejects a foreign
+/// protocol, a version we do not speak, and any flag bit we do not understand
+/// — all before the token is even compared, since none of them can be
+/// honoured. The version is returned so the caller knows whether to read the
+/// v4 stream tail.
+pub fn decode_handshake(buf: &[u8; HANDSHAKE_LEN]) -> io::Result<(u8, u8, [u8; TOKEN_LEN])> {
     if u32::from_le_bytes(buf[..4].try_into().unwrap()) != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "not a thunderflash sender",
         ));
     }
-    if buf[4] != VERSION {
+    if buf[4] != VERSION && buf[4] != VERSION_MULTI {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "sender speaks protocol v{}, this build speaks v{VERSION}",
+                "sender speaks protocol v{}, this build speaks v{VERSION} or v{VERSION_MULTI}",
                 buf[4]
             ),
         ));
@@ -216,7 +298,39 @@ pub fn decode_handshake(buf: &[u8; HANDSHAKE_LEN]) -> io::Result<(u8, [u8; TOKEN
             format!("sender set unknown handshake flags 0x{flags:02x}"),
         ));
     }
-    Ok((flags, buf[6..].try_into().unwrap()))
+    Ok((buf[4], flags, buf[6..].try_into().unwrap()))
+}
+
+/// A parsed handshake: protocol version, flags, the shared token, and — for
+/// v4 — the session's flow count and this connection's index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Handshake {
+    pub version: u8,
+    pub flags: u8,
+    pub token: [u8; TOKEN_LEN],
+    /// v4 only: `(total flows, this connection's index)`.
+    pub streams: Option<(u32, u32)>,
+}
+
+/// Read a full handshake off a connection: the base, and for v4 the stream
+/// tail.
+pub fn read_handshake(reader: &mut impl Read) -> io::Result<Handshake> {
+    let mut buf = [0u8; HANDSHAKE_LEN];
+    reader.read_exact(&mut buf)?;
+    let (version, flags, token) = decode_handshake(&buf)?;
+    let streams = if version == VERSION_MULTI {
+        let mut tail = [0u8; STREAMS_EXTRA_LEN];
+        reader.read_exact(&mut tail)?;
+        Some(decode_streams(&tail))
+    } else {
+        None
+    };
+    Ok(Handshake {
+        version,
+        flags,
+        token,
+        streams,
+    })
 }
 
 pub fn write_terminator(writer: &mut impl Write) -> io::Result<()> {
@@ -525,12 +639,35 @@ mod tests {
     }
 
     #[test]
-    fn handshake_round_trips_flags_and_token() {
+    fn handshake_round_trips_version_flags_and_token() {
         let token = [0xA5u8; TOKEN_LEN];
         for flags in [0, FLAG_NO_VERIFY] {
             let buf = encode_handshake(flags, &token);
-            assert_eq!(decode_handshake(&buf).unwrap(), (flags, token));
+            assert_eq!(decode_handshake(&buf).unwrap(), (VERSION, flags, token));
         }
+    }
+
+    #[test]
+    fn multi_handshake_round_trips_streams_tail() {
+        let token = [0x1Du8; TOKEN_LEN];
+        for (count, index) in [(2u32, 0u32), (4, 1), (16, 15)] {
+            let hs = encode_handshake_multi(FLAG_NO_VERIFY, &token, count, index);
+            let mut cursor = std::io::Cursor::new(hs);
+            let got = read_handshake(&mut cursor).unwrap();
+            assert_eq!(got.version, VERSION_MULTI);
+            assert_eq!(got.flags, FLAG_NO_VERIFY);
+            assert_eq!(got.token, token);
+            assert_eq!(got.streams, Some((count, index)));
+        }
+    }
+
+    #[test]
+    fn v3_handshake_has_no_streams_tail() {
+        let token = [0x2Eu8; TOKEN_LEN];
+        let mut cursor = std::io::Cursor::new(encode_handshake(0, &token));
+        let got = read_handshake(&mut cursor).unwrap();
+        assert_eq!(got.version, VERSION);
+        assert_eq!(got.streams, None);
     }
 
     #[test]

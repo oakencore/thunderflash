@@ -1,19 +1,20 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver as ChanReceiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::progress::{Diag, Progress, add_elapsed, pooled_recv};
 use crate::sys;
 use crate::wire::{
-    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, HANDSHAKE_LEN, HANDSHAKE_TIMEOUT,
-    IDLE_TIMEOUT, Kind, Stats, TOKEN_LEN, ct_eq, decode_handshake, encode_bitmap, queue_depth,
-    sanitize, set_timeouts,
+    ACK, CHUNK, DIGEST_LEN, Digest, Entry, FLAG_NO_VERIFY, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, Kind,
+    MAX_STREAMS, NOCACHE_MIN, Stats, TOKEN_LEN, VERSION_MULTI, ct_eq, encode_bitmap, hash_update,
+    queue_depth, read_handshake, sanitize, set_timeouts,
 };
 
 /// Work handed to the writer thread. `Begin` carries the descriptors the
@@ -69,6 +70,65 @@ impl Drop for InFlight {
     }
 }
 
+/// The directories whose contents changed during a durable session.
+///
+/// Flushing the destination root alone is not enough for a nested tree: a
+/// rename, mkdir or symlink only survives a power cut once the *directory
+/// that received the entry* is fsync'd — usually a subdirectory, often never
+/// the root. Every party that adds an entry records its parent here, and the
+/// session's final pass flushes all of them.
+///
+/// Deduplicated by `(device, inode)`: entries arrive depth-first, so one
+/// directory normally receives hundreds of entries but is flushed exactly
+/// once. The registered descriptor pins the inode, for the same reason the
+/// parent cache keeps its open directories.
+pub(crate) struct DirRegistry {
+    seen: HashSet<(u64, u64)>,
+    dirs: Vec<Arc<OwnedFd>>,
+}
+
+impl DirRegistry {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            dirs: Vec::new(),
+        }
+    }
+
+    /// Record `dir` as having received a new entry, and keep it open through
+    /// the final flush.
+    fn register(&mut self, dir: &Arc<OwnedFd>) -> io::Result<()> {
+        let id = sys::fd_identity(dir.as_fd())?;
+        if self.seen.insert(id) {
+            self.dirs.push(Arc::clone(dir));
+        }
+        Ok(())
+    }
+
+    /// Fsync every recorded directory.
+    fn flush_all(&self) -> io::Result<()> {
+        for dir in &self.dirs {
+            sys::full_fsync(dir.as_raw_fd())?;
+        }
+        Ok(())
+    }
+}
+
+/// Record that `parent` received a new entry, for the session's final
+/// durable flush. A non-durable session carries no registry and this is a
+/// no-op, which is also why a `None` costs nothing in the data path.
+fn register_parent(
+    regs: &Option<Arc<Mutex<DirRegistry>>>,
+    parent: &Arc<OwnedFd>,
+) -> io::Result<()> {
+    if let Some(regs) = regs {
+        regs.lock()
+            .expect("registry lock poisoned: a registrant panicked, which already unwinds to a join the caller checks")
+            .register(parent)?;
+    }
+    Ok(())
+}
+
 /// Drain the queue onto disk. Runs on one thread for the whole session.
 ///
 /// Ends the file's life in every direction: normal completion stamps mtime
@@ -78,11 +138,16 @@ impl Drop for InFlight {
 ///
 /// With `durable`, a file is not complete until it has also been flushed to
 /// permanent storage; a failed flush is as fatal as a failed write.
+///
+/// `regs` is the durability registry: after a successful rename the
+/// destination directory recorded it, so the session's final pass can flush
+/// it. Present only for durable sessions, where every entry must settle.
 fn write_loop(
     rx: ChanReceiver<Msg>,
     pool: SyncSender<Vec<u8>>,
     diag: Option<Arc<Diag>>,
     durable: bool,
+    regs: Option<Arc<Mutex<DirRegistry>>>,
 ) -> io::Result<()> {
     let mut current: Option<InFlight> = None;
     let diag = diag.as_deref();
@@ -116,7 +181,11 @@ fn write_loop(
                 if let Some(mut open) = current.take() {
                     // The mode is applied only now: creating with it would
                     // make a read-only file unwritable to our own writer.
-                    let _ = sys::set_mode_fd(open.file.as_raw_fd(), open.mode);
+                    // Creation already set mode|0o600, so files whose owner
+                    // bits are fully set need no fchmod at all.
+                    if open.mode & 0o600 != 0o600 {
+                        let _ = sys::set_mode_fd(open.file.as_raw_fd(), open.mode);
+                    }
                     let _ = sys::set_mtime_fd(open.file.as_raw_fd(), open.mtime);
                     if durable {
                         // After the stamp, so the mtime is what gets persisted.
@@ -136,13 +205,19 @@ fn write_loop(
                     // The last step, and the only one that makes the new
                     // contents visible under the real name: everything above
                     // can still fail with the previous file intact.
-                    if let Some(final_name) = open.final_name.take()
-                        && let Err(err) =
+                    if let Some(final_name) = open.final_name.take() {
+                        if let Err(err) =
                             sys::rename_at(open.parent.as_fd(), &open.name, &final_name)
-                    {
-                        drop(open);
-                        drop(rx);
-                        return Err(err);
+                        {
+                            drop(open);
+                            drop(rx);
+                            return Err(err);
+                        }
+                        // A new directory entry was made: credit the
+                        // directory that received it so the durable pass
+                        // flushes it. In-place writes have no rename, so no
+                        // parent to charge — the file's own flush covers it.
+                        register_parent(&regs, &open.parent)?;
                     }
                     open.finished = true;
                 }
@@ -158,8 +233,10 @@ fn write_loop(
 }
 
 /// Middle stage: hashes each buffer on its way from the network thread to the
-/// writer, so socket reads, hashing and disk writes all overlap. BLAKE3 is
-/// sequential over one file, so this thread is the receiver's hashing budget.
+/// writer, so socket reads, hashing and disk writes all overlap. The hash
+/// state itself stays on this one thread (order is order), but the
+/// compression work inside `hash_update` spreads across cores for buffers at
+/// or above `RAYON_MIN`.
 ///
 /// It only computes; the network thread compares and decides, which keeps the
 /// unlink contract exactly where it was — the writer, and only the writer,
@@ -172,7 +249,7 @@ fn hash_loop(rx: ChanReceiver<Msg>, tx: SyncSender<Msg>, diag: Option<Arc<Diag>>
         let forward = match msg {
             Msg::Data { buf, len } => {
                 let started = Instant::now();
-                hasher.update(&buf[..len]);
+                hash_update(&mut hasher, &buf[..len]);
                 if let Some(diag) = diag {
                     add_elapsed(&diag.hash_nanos, started);
                 }
@@ -232,8 +309,9 @@ impl Receiver {
         self
     }
 
-    /// Flush every file and the destination directory to permanent storage
-    /// before acknowledging the transfer. Costs throughput; see the README.
+    /// Flush every file and every directory that received an entry to
+    /// permanent storage before acknowledging the transfer. Costs throughput;
+    /// see the README.
     pub fn with_durable(mut self, durable: bool) -> Receiver {
         self.durable = durable;
         self
@@ -252,16 +330,34 @@ impl Receiver {
             add_elapsed(&diag.accept_nanos, waiting);
         }
         sys::set_socket_buffers(stream.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
+        // The bitmap reply and the final ACK are tiny writes; without this
+        // they can wait out Nagle's timer before they set out.
+        stream.set_nodelay(true)?;
         // A peer that connects and then says nothing must not pin the only
         // session this process will ever accept. Both loops treat any read or
         // write error as fatal-and-clean-up, so a timeout needs no new path.
         set_timeouts(&stream, HANDSHAKE_TIMEOUT)?;
-        let verify = self.verify_handshake(&mut stream, peer)?;
+        let (verify, streams) = self.verify_handshake(&mut stream, peer)?;
         set_timeouts(&stream, IDLE_TIMEOUT)?;
-        let (skipped_files, skipped_bytes) = self.answer_manifest(&mut stream)?;
-        let mut stats = self.receive_entries(&mut stream, progress, verify)?;
-        stats.skipped_files = skipped_files;
-        stats.skipped_bytes = skipped_bytes;
+        let mut staged = Staged::new(stream);
+        let (skipped_files, skipped_bytes) = self.answer_manifest(&mut staged)?;
+
+        let stats = match streams {
+            // v3: the single-stream path, unchanged.
+            None => {
+                let mut stats = self.receive_entries(&mut staged, progress, verify)?;
+                stats.skipped_files = skipped_files;
+                stats.skipped_bytes = skipped_bytes;
+                stats
+            }
+            // v4: the band arrives next; one pipeline per flow, one ACK.
+            Some((count, _index)) => {
+                let mut stats = self.accept_multi(&mut staged, count, progress, verify)?;
+                stats.skipped_files = skipped_files;
+                stats.skipped_bytes = skipped_bytes;
+                stats
+            }
+        };
         Ok(stats)
     }
 
@@ -273,10 +369,13 @@ impl Receiver {
     /// file we cannot stat, for any reason at all, is simply one we do not
     /// have, and the transfer carries on as if v2. Returns what the answer
     /// saved, so the summary can say so.
-    fn answer_manifest(&self, stream: &mut TcpStream) -> io::Result<(u64, u64)> {
+    fn answer_manifest(&self, stream: &mut Staged) -> io::Result<(u64, u64)> {
         let root = sys::open_dir(&self.dest)?;
         let mut bits = Vec::new();
         let (mut files, mut bytes) = (0u64, 0u64);
+        // Entries arrive depth-first, so consecutive files share their
+        // parent: keep it open instead of re-walking the chain per entry.
+        let mut parents = ParentCache::default();
 
         while let Some(entry) = Entry::decode(stream)? {
             // Dirs are EEXIST-tolerant and symlink payloads are tens of bytes,
@@ -284,7 +383,7 @@ impl Receiver {
             if entry.kind != Kind::File {
                 continue;
             }
-            let have = already_have(root.as_fd(), &entry);
+            let have = self.file_held(&root, &mut parents, &entry);
             if have {
                 files += 1;
                 bytes += entry.size;
@@ -292,20 +391,56 @@ impl Receiver {
             bits.push(have);
         }
 
-        stream.write_all(&encode_bitmap(&bits))?;
-        stream.flush()?;
+        stream.stream().write_all(&encode_bitmap(&bits))?;
+        stream.stream().flush()?;
         Ok((files, bytes))
     }
 
-    /// Returns whether the sender's stream carries digests to check.
+    /// Does the destination already hold this exact file?
+    ///
+    /// Deliberately total: every way of not knowing — a path we refuse, a
+    /// missing component, a symlink where a file should be, a directory we
+    /// cannot open — answers "no". The check only ever decides whether bytes
+    /// travel, so being wrong costs a retransfer, while failing here would
+    /// cost the transfer.
+    ///
+    /// Size and mtime are enough because the receiver stamps the sender's
+    /// mtime on completion: a file that matches both was put there by this
+    /// tool, from this source, and a file still being written has neither.
+    fn file_held(&self, root: &OwnedFd, parents: &mut ParentCache, entry: &Entry) -> bool {
+        let Ok(components) = sanitize(&entry.path) else {
+            return false;
+        };
+        let (name, parent_names) = match components.split_last() {
+            Some((name, parent_names)) => (name, parent_names),
+            None => return false,
+        };
+        // Open-only walk: the check must not leave a trace of a file it
+        // decides against, so no mkdir is involved.
+        let dir = match parents.get(parent_names, || {
+            Ok(Arc::new(sys::open_dir_chain(root.as_fd(), parent_names)?))
+        }) {
+            Ok(dir) => dir,
+            Err(_) => return false,
+        };
+        matches!(
+            sys::stat_file_in_dir(dir.as_fd(), name),
+            Ok((size, mtime)) if size == entry.size && mtime == entry.mtime
+        )
+    }
+
+    /// Returns whether the sender's stream carries digests to check, and the
+    /// stream pairing when the sender speaks v4: `(count, index)` with the
+    /// primary connection — the one carrying the manifest — arriving first.
     fn verify_handshake(
         &self,
         stream: &mut TcpStream,
         peer: std::net::SocketAddr,
-    ) -> io::Result<bool> {
-        let mut buf = [0u8; HANDSHAKE_LEN];
-        stream.read_exact(&mut buf)?;
-        let (flags, token) = decode_handshake(&buf)?;
+    ) -> io::Result<(bool, Option<(u32, u32)>)> {
+        let hs = read_handshake(stream)?;
+        let flags = hs.flags;
+        let token = hs.token;
+        let streams = hs.streams;
         if !ct_eq(&token, &self.token) {
             eprintln!("refused a connection from {peer}: token mismatch");
             return Err(io::Error::new(
@@ -317,14 +452,40 @@ impl Receiver {
         if !verify {
             eprintln!("tf: content verification disabled by sender");
         }
-        Ok(verify)
+        if let Some((count, index)) = streams {
+            // The primary must come first — it carries the manifest — and it
+            // must be pairing with our own flow count.
+            if index != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("v4 stream index {index} arrived before the primary (index 0)"),
+                ));
+            }
+            // The sender decides the flow count; the receiver just
+            // accommodates it, bounded so a hostile handshake cannot pin
+            // unbounded memory.
+            if !(2..=MAX_STREAMS).contains(&count) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("v4 stream count {count} out of range (2..={MAX_STREAMS})"),
+                ));
+            }
+        }
+        Ok((verify, streams))
     }
 
-    fn receive_entries(
+    /// One stream's data phase: net thread on the given stream, with its own
+    /// hash and writer threads, until the terminator. Returns the stream's
+    /// own stats; the session-level interests — the final directory flush and
+    /// the ACK — stay with the caller, because in a v4 session they only make
+    /// sense once every stream has finished.
+    fn run_pipeline(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut Staged,
         progress: &Progress,
         verify: bool,
+        durable: bool,
+        regs: Option<Arc<Mutex<DirRegistry>>>,
     ) -> io::Result<Stats> {
         let depth = queue_depth();
         let (tx, rx) = sync_channel::<Msg>(depth);
@@ -335,8 +496,9 @@ impl Receiver {
                 .expect("pool receiver is alive");
         }
         let writer_diag = self.diag.clone();
-        let durable = self.durable;
-        let writer = std::thread::spawn(move || write_loop(rx, pool_tx, writer_diag, durable));
+        let writer_regs = regs.clone();
+        let writer =
+            std::thread::spawn(move || write_loop(rx, pool_tx, writer_diag, durable, writer_regs));
         // net -> hash -> write: the buffers pass through, still bounded by the
         // same pool, so memory is unchanged and the three stages overlap.
         // A no-verify stream has nothing to hash, so the stage is skipped and
@@ -354,7 +516,7 @@ impl Receiver {
             (tx, None)
         };
 
-        let received = self.read_entries(stream, &entry_tx, &pool_rx, progress, verify);
+        let received = self.read_entries(stream, &entry_tx, &pool_rx, progress, verify, regs);
         drop(entry_tx);
         // Both joins happen before any `?`: returning early on a hash-thread
         // panic would leave the writer detached, still holding a file it is
@@ -367,35 +529,176 @@ impl Receiver {
         if let Some(Err(_)) = hashed {
             return Err(io::Error::other("receiver hash thread panicked"));
         }
-        let stats = received?;
+        received
+    }
 
-        // Every file is already flushed by here; the names themselves live in
-        // the directory, which needs its own flush to survive a power cut.
-        if self.durable {
+    /// The v3 data phase: one stream, ending in the session's directory flush
+    /// and the acknowledgement.
+    fn receive_entries(
+        &self,
+        stream: &mut Staged,
+        progress: &Progress,
+        verify: bool,
+    ) -> io::Result<Stats> {
+        let durable = self.durable;
+        // A durable session must flush every directory that received an
+        // entry, so the net thread and the writer both record them here.
+        // Non-durable keeps it `None`: no registration, no final flush.
+        let regs = durable.then(|| Arc::new(Mutex::new(DirRegistry::new())));
+        let flush = regs.clone();
+        let stats = self.run_pipeline(stream, progress, verify, durable, regs)?;
+        self.flush_directories(&flush)?;
+        // Only now is every byte committed, so it is safe to let the sender
+        // claim success.
+        stream.stream().write_all(&[ACK])?;
+        stream.stream().flush()?;
+        Ok(stats)
+    }
+
+    /// v4 data phase: the primary stream has answered the manifest, the other
+    /// connections arrive next, and every stream's pipeline then runs at
+    /// once. The acknowledgement goes out once — on the primary — after the
+    /// last byte of the last stream, past the single shared directory flush.
+    fn accept_multi(
+        &self,
+        primary: &mut Staged,
+        count: u32,
+        progress: &Progress,
+        verify: bool,
+    ) -> io::Result<Stats> {
+        let durable = self.durable;
+        // One shared registry across every stream: each directory that
+        // received an entry is flushed exactly once, before any ACK exists.
+        let regs = durable.then(|| Arc::new(Mutex::new(DirRegistry::new())));
+
+        // The sender opens the band right after its manifest exchange, so
+        // accept them all first, then run the pipelines concurrently.
+        let mut bands: Vec<(u32, TcpStream)> = Vec::with_capacity(count as usize - 1);
+        for _ in 0..(count - 1) {
+            let waiting = Instant::now();
+            let (mut stream, peer) = self.listener.accept()?;
+            if let Some(diag) = self.diag.as_deref() {
+                add_elapsed(&diag.accept_nanos, waiting);
+            }
+            sys::set_socket_buffers(stream.as_raw_fd(), sys::SOCKET_BUFFER_BYTES)?;
+            stream.set_nodelay(true)?;
+            set_timeouts(&stream, HANDSHAKE_TIMEOUT)?;
+            let hs = read_handshake(&mut stream)?;
+            let version = hs.version;
+            let flags = hs.flags;
+            let token = hs.token;
+            let streams = hs.streams;
+            if !ct_eq(&token, &self.token) {
+                eprintln!("refused a connection from {peer}: token mismatch");
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "token mismatch",
+                ));
+            }
+            if version != VERSION_MULTI {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("v4 band carried a v{version} handshake"),
+                ));
+            }
+            let Some((band_count, index)) = streams else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "v4 band stream carries no stream tail",
+                ));
+            };
+            if band_count != count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "band stream announces {band_count} streams, the primary announced {count}"
+                    ),
+                ));
+            }
+            if index == 0 || index >= count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("stream index {index} is not inside a {count}-stream session"),
+                ));
+            }
+            if (flags & FLAG_NO_VERIFY == 0) != verify {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "verify setting differs across v4 streams",
+                ));
+            }
+            set_timeouts(&stream, IDLE_TIMEOUT)?;
+            bands.push((index, stream));
+        }
+
+        let total = std::thread::scope(|s| {
+            // Band streams on their own threads, the primary on this one:
+            // one pipeline per flow, all sharing the durable registry.
+            let mut handles = Vec::with_capacity(bands.len());
+            for (index, stream) in bands {
+                let mut staged = Staged::new(stream);
+                let band_regs = regs.clone();
+                handles.push(s.spawn(move || {
+                    self.run_pipeline(&mut staged, progress, verify, durable, band_regs)
+                        .map_err(|err| io::Error::other(format!("v4 stream {index}: {err}")))
+                }));
+            }
+            let primary_stats =
+                self.run_pipeline(primary, progress, verify, durable, regs.clone())?;
+            let mut total = primary_stats;
+            for handle in handles {
+                let stats = handle
+                    .join()
+                    .map_err(|_| io::Error::other("receiver stream thread panicked"))?;
+                let stats = stats?;
+                total.files += stats.files;
+                total.bytes += stats.bytes;
+            }
+            Ok::<_, io::Error>(total)
+        })?;
+
+        self.flush_directories(&regs)?;
+
+        // One acknowledgement, on the primary: the sender treats only this
+        // byte as session success, and it exists only after every stream is
+        // committed and the shared directory flush has passed.
+        primary.stream().write_all(&[ACK])?;
+        primary.stream().flush()?;
+        Ok(total)
+    }
+
+    /// The final durable pass, between "every pipeline finished" and "the ACK
+    /// may exist".
+    fn flush_directories(&self, regs: &Option<Arc<Mutex<DirRegistry>>>) -> io::Result<()> {
+        if let Some(regs) = regs {
             let started = Instant::now();
-            let root = sys::open_dir(&self.dest)?;
-            sys::full_fsync(root.as_raw_fd())?;
+            let result = regs
+                .lock()
+                .expect("registry lock poisoned: a registrant panicked, which already unwinds to a join the caller checks")
+                .flush_all();
             if let Some(diag) = self.diag.as_deref() {
                 add_elapsed(&diag.flush_nanos, started);
             }
+            result
+        } else {
+            Ok(())
         }
-
-        // Only now is every byte committed, so it is safe to let the sender
-        // claim success.
-        stream.write_all(&[ACK])?;
-        stream.flush()?;
-        Ok(stats)
     }
 
     fn read_entries(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut Staged,
         tx: &SyncSender<Msg>,
         pool: &ChanReceiver<Vec<u8>>,
         progress: &Progress,
         verify: bool,
+        regs: Option<Arc<Mutex<DirRegistry>>>,
     ) -> io::Result<Stats> {
-        let root = sys::open_dir(&self.dest)?;
+        let root = Arc::new(sys::open_dir(&self.dest)?);
+        // The destination root counts even when every entry under it skips:
+        // a durable session that changes nothing still owes the root a flush,
+        // as the old root-only fsync always gave it.
+        register_parent(&regs, &root)?;
         let mut stats = Stats::default();
         let diag = self.diag.as_deref();
         let sink = Sink { tx, pool, diag };
@@ -420,7 +723,9 @@ impl Receiver {
 
             // walk_dirs opens each component with O_NOFOLLOW, so a symlinked
             // parent aborts here rather than redirecting the write.
-            let dir = parent_cache.get(root.as_fd(), parents)?;
+            let dir = parent_cache.get(parents, || {
+                Ok(Arc::new(sys::walk_dirs(root.as_fd(), parents)?))
+            })?;
             if let Some(diag) = diag {
                 add_elapsed(&diag.meta_nanos, meta_started);
             }
@@ -439,6 +744,8 @@ impl Receiver {
                     sys::mkdir_at(dir.as_fd(), name, entry.mode | 0o700)?;
                     // Files are stamped by the writer once their last byte lands.
                     let _ = sys::set_mtime_at(dir.as_fd(), name, entry.mtime);
+                    // `dir` received a new entry: flush it if the session is durable.
+                    register_parent(&regs, &dir)?;
                     if let Some(diag) = diag {
                         add_elapsed(&diag.meta_nanos, meta_started);
                         diag.dirs.fetch_add(1, Relaxed);
@@ -465,6 +772,11 @@ impl Receiver {
                     // Replace any existing entry so repeat transfers work.
                     let _ = sys::unlink_at(dir.as_fd(), name);
                     sys::symlink_at(&target, dir.as_fd(), name)?;
+                    // Stamped like file contents: the link's own mtime is part
+                    // of what "unchanged" means on the next manifest.
+                    let _ = sys::set_mtime_at(dir.as_fd(), name, entry.mtime);
+                    // The entry (or its replacement) landed in `dir`.
+                    register_parent(&regs, &dir)?;
                     // Counted so both ends agree on the byte total; the
                     // sender puts the target on the wire the same way.
                     stats.bytes += entry.size;
@@ -489,26 +801,6 @@ impl Receiver {
         }
         Ok(stats)
     }
-}
-
-/// Does the destination already hold this exact file?
-///
-/// Deliberately total: every way of not knowing — a path we refuse, a missing
-/// component, a symlink where a file should be, a directory we cannot open —
-/// answers "no". The check only ever decides whether bytes travel, so being
-/// wrong costs a retransfer, while failing here would cost the transfer.
-///
-/// Size and mtime are enough because the receiver stamps the sender's mtime on
-/// completion: a file that matches both was put there by this tool, from this
-/// source, and a file still being written has neither.
-fn already_have(root: BorrowedFd, entry: &Entry) -> bool {
-    let Ok(components) = sanitize(&entry.path) else {
-        return false;
-    };
-    matches!(
-        sys::stat_regular_file(root, &components),
-        Ok((size, mtime)) if size == entry.size && mtime == entry.mtime
-    )
 }
 
 /// The directory the previous entry lived in, kept open.
@@ -540,14 +832,20 @@ struct ParentCache {
 }
 
 impl ParentCache {
-    fn get(&mut self, root: BorrowedFd, parents: &[&str]) -> io::Result<Arc<OwnedFd>> {
+    /// The parent's descriptor, reusing the cache on an identical component
+    /// list and calling `open` — fresh O_NOFOLLOW walk, mkdir allowed or not
+    /// is the caller's choice — when the last entry lived elsewhere.
+    fn get<F>(&mut self, parents: &[&str], open: F) -> io::Result<Arc<OwnedFd>>
+    where
+        F: FnOnce() -> io::Result<Arc<OwnedFd>>,
+    {
         if let Some(dir) = &self.dir
             && self.components.len() == parents.len()
             && self.components.iter().zip(parents).all(|(a, b)| a == b)
         {
             return Ok(Arc::clone(dir));
         }
-        let dir = Arc::new(sys::walk_dirs(root, parents)?);
+        let dir = open()?;
         self.components.clear();
         self.components
             .extend(parents.iter().map(|p| p.to_string()));
@@ -564,6 +862,61 @@ struct Sink<'a> {
     diag: Option<&'a Diag>,
 }
 
+/// Upper bound on staged bytes. Small enough to be one socket read's worth,
+/// big enough that a small file's whole header, payload and digest decode
+/// from memory.
+const STAGE_CAP: usize = 64 * 1024;
+
+/// A socket behind a small staging buffer. Entry headers are eight fields
+/// (kind, length, path, size, mode, mtime) that each used to cost a read
+/// syscall; digests and small payloads did too. With staging, one socket
+/// read covers many entries and they decode from memory.
+///
+/// Large reads — the pooled CHUNK buffers — bypass the stage: a double copy
+/// at 4 MiB would cost more than the syscalls it saves, so they go straight
+/// to the socket whenever the stage is drained.
+struct Staged {
+    stream: TcpStream,
+    stage: Vec<u8>,
+    off: usize,
+    end: usize,
+}
+
+impl Staged {
+    fn new(stream: TcpStream) -> Staged {
+        Staged {
+            stream,
+            stage: vec![0u8; STAGE_CAP],
+            off: 0,
+            end: 0,
+        }
+    }
+
+    /// For the writes this struct does not buffer: the manifest bitmap and
+    /// the final acknowledgement.
+    fn stream(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+}
+
+impl Read for Staged {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.off == self.end {
+            if buf.len() >= STAGE_CAP {
+                // Drained and big: socket straight into the caller's buffer.
+                return self.stream.read(buf);
+            }
+            let end = self.stream.read(&mut self.stage)?;
+            self.off = 0;
+            self.end = end;
+        }
+        let n = buf.len().min(self.end - self.off);
+        buf[..n].copy_from_slice(&self.stage[self.off..self.off + n]);
+        self.off += n;
+        Ok(n)
+    }
+}
+
 /// Placeholder: the writer's own error replaces this on join.
 fn writer_gone() -> io::Error {
     io::Error::other("receiver writer thread stopped")
@@ -577,7 +930,7 @@ fn writer_gone() -> io::Error {
 /// unlinks whatever file is still in flight when the channel closes, so
 /// exactly one party removes a file that failed verification.
 fn check_digest(
-    stream: &mut TcpStream,
+    stream: &mut Staged,
     actual: Digest,
     path: &str,
     diag: Option<&Diag>,
@@ -601,7 +954,7 @@ fn check_digest(
 /// Read one file's payload off the socket into pooled buffers and hand them to
 /// the writer. Never touches the file's contents itself.
 fn pump_file(
-    stream: &mut TcpStream,
+    stream: &mut Staged,
     dir: &Arc<OwnedFd>,
     name: &str,
     entry: &Entry,
@@ -630,8 +983,11 @@ fn pump_file(
         ),
         Err(err) => return Err(err),
     };
-    // Advisory only, and non-fatal on the sender too.
-    let _ = sys::set_nocache(file.as_raw_fd());
+    // Advisory only, and non-fatal on the sender too. Sized the same way:
+    // per-file fcntl for a 4 KiB file costs more than the cache it protects.
+    if entry.size >= NOCACHE_MIN {
+        let _ = sys::set_nocache(file.as_raw_fd());
+    }
     if let Some(diag) = sink.diag {
         add_elapsed(&diag.meta_nanos, meta_started);
     }
@@ -714,9 +1070,9 @@ fn pump_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Entry, Kind};
+    use crate::wire::{Entry, HANDSHAKE_LEN, Kind};
     use std::io::Write;
-    use std::net::TcpStream;
+    use std::net::{TcpListener, TcpStream};
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tf-recv-{}-{}", name, std::process::id()));
@@ -727,6 +1083,29 @@ mod tests {
 
     fn handshake(token: &[u8; TOKEN_LEN]) -> [u8; HANDSHAKE_LEN] {
         crate::wire::encode_handshake(0, token)
+    }
+
+    /// Two independent descriptors for the same directory dedup to one flush;
+    /// a different directory stays a second one.
+    #[test]
+    fn the_registry_dedups_by_inode_and_keeps_distinct_dirs() {
+        let dir = scratch("registry");
+        let other = scratch("registry-other");
+
+        let same_a = Arc::new(sys::open_dir(&dir).unwrap());
+        let same_b = Arc::new(sys::open_dir(&dir).unwrap());
+        let diff = Arc::new(sys::open_dir(&other).unwrap());
+
+        let mut reg = DirRegistry::new();
+        reg.register(&same_a).unwrap();
+        reg.register(&same_b).unwrap();
+        reg.register(&diff).unwrap();
+        assert_eq!(reg.dirs.len(), 2, "same-inode pair must collapse to one");
+
+        // A second round over the same descriptors adds nothing new.
+        reg.register(&same_a).unwrap();
+        reg.register(&diff).unwrap();
+        assert_eq!(reg.dirs.len(), 2, "re-registration must not grow the set");
     }
 
     /// The name the bytes actually land under, which is what the cleanup
@@ -762,6 +1141,45 @@ mod tests {
         let mut bitmap = vec![0u8; files.div_ceil(8)];
         stream.read_exact(&mut bitmap).unwrap();
         bitmap
+    }
+
+    /// Small reads must keep coming from the stage and large ones skip
+    /// straight to the socket, but the assembled bytes may never diverge
+    /// from the stream in either order or content.
+    #[test]
+    fn staged_reads_preserve_stream_order_across_buffer_sizes() {
+        let expected: Vec<u8> = (0..STAGE_CAP as u32 * 2 + 5)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let total = expected.len();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let send = expected.clone();
+        let filler = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&send).unwrap();
+        });
+
+        let mut staged = Staged::new(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap());
+        let sizes = [1usize, 3, STAGE_CAP - 1, STAGE_CAP, CHUNK, 7];
+        let mut got = Vec::new();
+        let mut i = 0;
+        loop {
+            let remaining = total - got.len();
+            let want = sizes[i % sizes.len()].min(remaining).max(1);
+            i += 1;
+            let mut buf = vec![0u8; want];
+            match staged.read_exact(&mut buf) {
+                Ok(()) => got.extend(buf),
+                // One read past the end is the stop signal, not a failure.
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && got.len() == total => {
+                    break;
+                }
+                Err(err) => panic!("staged read failed: {err}"),
+            }
+        }
+        filler.join().unwrap();
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -876,7 +1294,7 @@ mod tests {
         (
             tx,
             pool_rx,
-            std::thread::spawn(move || write_loop(rx, pool_tx, None, durable)),
+            std::thread::spawn(move || write_loop(rx, pool_tx, None, durable, None)),
         )
     }
 
